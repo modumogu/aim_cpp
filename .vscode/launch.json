@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "run (camera)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\build\\aim.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "run (video)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\build\\aim.exe",
+      "args": ["--video", "D:\\学习\\机甲杯\\py_sim\\data\\red_var\\video.mp4"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "build",
+      "console": "integratedTerminal"
+    }
+  ]
+}
