@@ -1,30 +1,32 @@
 // ============================================================================
-//  ROBOMINI 能量机关自瞄 —— 节点 4：相位解缠（mod 72°）
+//  ROBOMINI 能量机关自瞄 —— 节点 5：拟合 θ(t) + 预测
 // ============================================================================
 //
-//  节点 3 得到的是"每块靶各自的角度"，但它们都等于 θ + k×72°。
-//  这一节点把它们合成一个数：转盘转了多少（θ）。
+//  节点 4 得到的是"转盘转了多少"（θ），这一节点要做的是"100ms 之后它转到哪"。
 //
-//  两步：
-//      ① 乘 5 消掉槽位号 —— estimatePhase()
-//         5 块靶的方位角分别是 θ+0×72°、θ+1×72°、…、θ+4×72°
-//         角度乘 5 后，k×72°×5 = k×360° 全部绕回原点，只剩 5θ
-//         所有靶乘 5 后做向量平均，再除以 5，就得到 θ mod 72°
+//  模型：
+//      θ(t) = c0 + c1·t + c2·cos(ωt) + c3·sin(ωt)
+//             └──┬──┘   └───────┬───────┘
+//             匀速部分        正弦摆动部分
 //
-//      ② 折叠累加成连续角度 —— PhaseTracker
-//         mod 72° 的值每转 72° 就跳一次，没法直接拟合。
-//         把相邻两帧之差折叠到 ±半个槽，得到"这一帧转了多少"，累加起来。
-//         单帧转动超过 0.8 个槽（约 57.6°）物理上不可能，当这帧无效。
+//      · 固定靶 / 随机固定靶 / 小机关  -> c1 起作用，c2≈c3≈0
+//      · 大机关                        -> c1、c2、c3 一起起作用
 //
-//  为什么第 ② 步的"跳变拒绝"这么重要：
-//      如果某帧把靶认错成隔壁那块，原始相位会瞬间跳 72°。
-//      不作废它，θ 就永久偏了 72°，之后所有预测全废。
+//  ω 不用估，直接网格搜索：手册 5.5.2 给了 ω ∈ [1.884, 2.000]，
+//  每个候选 ω 用最小二乘解 c0..c3，取残差最小的那个。
 //
-//  用法：同节点 3
+//  残差超限（>3°）就判定拟合不可信 -> HOLD。宁可不开火，也不乱打。
+//
+//  预测（关键）：
+//      target_pred = angle_now + (θ_future − θ_now)
+//  用的是"增量"，不是"绝对角度"。因为靶角 = θ + k×72°，
+//  换靶瞬间 k 会跳变，但只要做差，k 就被消掉了。这是整个算法里最巧的一处。
+//
+//  用法：同节点 4
 //
 //  验证标准：
-//      · 合成数据集：theta 连续递增（10° → 44° → 133° → 234°），不在 72° 处回落
-//      · 与 truth.csv 的 theta 对比，误差应 < 0.1°
+//      · 合成数据集：w 落在 1.88~2.00，rms < 0.05°，状态 READY
+//      · 与 truth.csv 的"100ms 后靶角"对比，误差 < 0.2°
 //
 // ============================================================================
 
@@ -35,6 +37,7 @@
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -61,6 +64,15 @@ constexpr double kPxPerMm = 0.8720;               // 标定得到：fx 1700 / 19
 constexpr double kDefWheelRpx = 350.0 * kPxPerMm; // ≈ 305 像素
 constexpr double kGroupGapDeg = 15.0;             // 角度聚类阈值（远小于 72°）
 constexpr double kRadiusTol = 0.45;               // 半径容差，±45%
+
+// ---- 拟合参数 --------------------------------------------------------------
+constexpr double kFitWindowS = 1.5;    // 只用最近 1.5 秒的数据
+constexpr int kMinFitSamples = 20;     // 至少 20 个采样点才拟合
+constexpr double kOmegaMin = 1.884;    // 手册 5.5.2
+constexpr double kOmegaMax = 2.000;
+constexpr double kOmegaStep = 0.004;
+constexpr double kMaxFitRms = 0.05;    // 弧度，约 3°；超过就 HOLD
+constexpr double kLeadS = 0.10;        // 预测提前量：100ms
 
 // ---- 颜色阈值 --------------------------------------------------------------
 // 红色在 HSV 的 H 上跨 0 和 179 两端，所以要两段。
@@ -216,48 +228,41 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
 // ============================================================================
 //  ④ 相位解缠
 // ============================================================================
-
-// ① 乘 5 消掉槽位号：(θ + k×72°) × 5 = 5θ + k×360° ≡ 5θ
 bool estimatePhase(const std::vector<Plate>& plates, double* raw_out) {
     if (plates.empty()) return false;
 
     double sx = 0.0, sy = 0.0;
     for (const auto& p : plates) {
-        double a = p.angle_deg * CV_PI / 180.0;   // 转成弧度再乘 5
+        double a = p.angle_deg * CV_PI / 180.0;
         sx += std::cos(kSlotCount * a);
         sy += std::sin(kSlotCount * a);
     }
-    // 向量互相抵消 -> 方向不可信（比如只剩一块靶、或者分布太乱）
     if (std::hypot(sx, sy) < 1e-6) return false;
 
     *raw_out = std::atan2(sy, sx) / kSlotCount;   // 弧度，落在 (-36°, +36°]
     return true;
 }
 
-// ② 折叠累加成连续角度，并拒绝可疑帧（防 72° 滑移）
 class PhaseTracker {
 public:
     explicit PhaseTracker(int slot_count) : half_slot_(CV_PI / slot_count) {}
 
     double update(bool has_raw, double raw) {
         if (!has_raw) return theta_;
-
-        if (!has_theta_) {          // 第一帧：直接作为起点
+        if (!has_theta_) {
             theta_ = raw;
             last_raw_ = raw;
             has_theta_ = true;
             return theta_;
         }
 
-        // 把两帧之差折叠到 ±半个槽：这才是"这一帧到底转了多少"
         const double two = 2.0 * half_slot_;
         double d = std::fmod(raw - last_raw_ + half_slot_, two);
         if (d < 0.0) d += two;
         d -= half_slot_;
 
-        // 一帧转超过 0.8 个槽（约 57.6°）——物理上不可能，当这帧无效
         if (std::fabs(d) > 0.8 * half_slot_) {
-            return theta_;
+            return theta_;      // 跳变拒绝，防 72° 滑移
         }
 
         theta_ += d;
@@ -275,6 +280,107 @@ private:
     double last_raw_ = 0.0;
     bool has_theta_ = false;
 };
+
+// ============================================================================
+//  ⑤ 拟合 θ(t)
+// ============================================================================
+struct MotionModel {
+    double omega = 0.0;
+    double c[4] = {0.0, 0.0, 0.0, 0.0};
+    double rms = 0.0;
+};
+
+// 4x4 线性方程组，高斯消元（部分主元）
+bool solve4(double A[4][4], const double b[4], double x[4]) {
+    double M[4][5];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) M[r][c] = A[r][c];
+        M[r][4] = b[r];
+    }
+    for (int col = 0; col < 4; ++col) {
+        int piv = col;
+        for (int r = col + 1; r < 4; ++r) {
+            if (std::fabs(M[r][col]) > std::fabs(M[piv][col])) piv = r;
+        }
+        if (std::fabs(M[piv][col]) < 1e-12) return false;   // 奇异
+        if (piv != col) {
+            for (int c = 0; c < 5; ++c) std::swap(M[col][c], M[piv][c]);
+        }
+        for (int r = 0; r < 4; ++r) {
+            if (r == col) continue;
+            double f = M[r][col] / M[col][col];
+            for (int c = col; c < 5; ++c) M[r][c] -= f * M[col][c];
+        }
+    }
+    for (int r = 0; r < 4; ++r) x[r] = M[r][4] / M[r][r];
+    return true;
+}
+
+bool fitMotion(const std::vector<std::pair<double, double>>& history, MotionModel* out) {
+    if (static_cast<int>(history.size()) < kMinFitSamples) return false;
+
+    const double t_now = history.back().first;
+    std::vector<double> ts, ys;
+    for (const auto& p : history) {
+        if (p.first >= t_now - kFitWindowS) {
+            ts.push_back(p.first - t_now);   // 以"现在"为原点，数值更稳
+            ys.push_back(p.second);
+        }
+    }
+    if (static_cast<int>(ts.size()) < kMinFitSamples) return false;
+
+    double best_rms = 1e18;
+    double best_w = 0.0;
+    double best_c[4] = {0.0, 0.0, 0.0, 0.0};
+
+    // ω 网格搜索：每个候选解一次最小二乘，留残差最小的
+    for (double w = kOmegaMin; w <= kOmegaMax + 1e-9; w += kOmegaStep) {
+        double A[4][4] = {{0}};
+        double b[4] = {0, 0, 0, 0};
+        for (size_t i = 0; i < ts.size(); ++i) {
+            double row[4] = {1.0, ts[i], std::cos(w * ts[i]), std::sin(w * ts[i])};
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) A[r][c] += row[r] * row[c];
+                b[r] += row[r] * ys[i];
+            }
+        }
+        double c[4];
+        if (!solve4(A, b, c)) continue;
+
+        double sse = 0.0;
+        for (size_t i = 0; i < ts.size(); ++i) {
+            double row[4] = {1.0, ts[i], std::cos(w * ts[i]), std::sin(w * ts[i])};
+            double pred = row[0] * c[0] + row[1] * c[1] + row[2] * c[2] + row[3] * c[3];
+            double e = ys[i] - pred;
+            sse += e * e;
+        }
+        double rms = std::sqrt(sse / static_cast<double>(ts.size()));
+        if (rms < best_rms) {
+            best_rms = rms;
+            best_w = w;
+            for (int k = 0; k < 4; ++k) best_c[k] = c[k];
+        }
+    }
+
+    if (best_rms > kMaxFitRms) return false;   // 不可信 -> HOLD
+
+    out->omega = best_w;
+    out->rms = best_rms;
+    for (int k = 0; k < 4; ++k) out->c[k] = best_c[k];
+    return true;
+}
+
+// ============================================================================
+//  ⑥ 预测：增量式
+//      target_pred = angle_now + (θ_future − θ_now)
+//  靶角 = θ + k×72°，换靶时 k 跳变，但做差就消掉了
+// ============================================================================
+double predictTarget(const MotionModel& m, double theta_now, double angle_now,
+                     double lead) {
+    double theta_future = m.c[0] + m.c[1] * lead + m.c[2] * std::cos(m.omega * lead) +
+                          m.c[3] * std::sin(m.omega * lead);
+    return angle_now + (theta_future - theta_now);
+}
 
 // ============================================================================
 //  打开相机
@@ -323,7 +429,7 @@ int main(int argc, char** argv) {
     int max_frames = 1;
     double exposure = kDefExposure;
     double wb_temp = kDefWbTemp;
-    double wheel_x = -1.0;       // -1 表示"用画面中心"
+    double wheel_x = -1.0;
     double wheel_y = -1.0;
     double R_px = kDefWheelRpx;
     std::string video_path, save_path;
@@ -382,6 +488,11 @@ int main(int argc, char** argv) {
     cv::Point2f wheel(0.0f, 0.0f);
     bool wheel_set = false;
     PhaseTracker tracker(kSlotCount);
+    std::vector<std::pair<double, double>> history;   // (t, theta)
+
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (fps <= 1.0) fps = 30.0;
+    const double t_start = cv::getTickCount() / cv::getTickFrequency();
 
     while (true) {
         cv::Mat frame;
@@ -412,7 +523,6 @@ int main(int argc, char** argv) {
         std::vector<Led> leds = detectLeds(mask, &raw_contours);
         std::vector<Plate> plates = assignSlots(leds, wheel, R_px);
 
-        // 待激活靶必须唯一
         int armed = -1;
         int armed_count = 0;
         for (size_t k = 0; k < plates.size(); ++k) {
@@ -426,21 +536,46 @@ int main(int argc, char** argv) {
         // ---- ④ 相位解缠 ----
         double raw_phase = 0.0;
         bool has_phase = estimatePhase(plates, &raw_phase);
-        tracker.update(has_phase, raw_phase);
-        double theta = tracker.theta();
+        double theta = tracker.update(has_phase, raw_phase);
+
+        // 时间戳：视频按帧号/帧率，相机用真实时钟
+        const double t_now = use_camera
+                                 ? (cv::getTickCount() / cv::getTickFrequency() - t_start)
+                                 : (idx / fps);
+
+        if (has_phase && tracker.has()) {
+            history.emplace_back(t_now, theta);
+            while (!history.empty() && history.front().first < t_now - 3.0 * kFitWindowS) {
+                history.erase(history.begin());
+            }
+        }
+
+        // ---- ⑤ 拟合 ----
+        MotionModel model;
+        bool has_model = fitMotion(history, &model);
+
+        // ---- ⑥ 预测 ----
+        bool ready = false;
+        double pred = 0.0;
+        if (has_model && tracker.has() && armed >= 0) {
+            pred = predictTarget(model, theta,
+                                 plates[armed].angle_deg * CV_PI / 180.0,
+                                 kLeadS) * 180.0 / CV_PI;
+            ready = true;
+        }
 
         if (idx % 30 == 0) {
-            std::cout << "frame " << idx
-                      << "  灯条 " << leds.size()
-                      << "  靶 " << plates.size();
-            if (armed >= 0) {
-                std::cout << "  待激活角度 " << plates[armed].angle_deg;
-            }
-            if (tracker.has()) {
-                std::printf("  theta %.2f (mod72 %+.1f)", theta * 180.0 / CV_PI,
-                            std::fmod(theta * 180.0 / CV_PI, 72.0));
-            }
-            std::cout << "\n";
+            std::printf("frame %d  灯条 %d  靶 %d", idx,
+                        static_cast<int>(leds.size()), static_cast<int>(plates.size()));
+            if (tracker.has()) std::printf("  theta %.1f", tracker.thetaDeg());
+            if (has_model)
+                std::printf("  w=%.3f  rms=%.2f", model.omega,
+                            model.rms * 180.0 / CV_PI);
+            if (ready)
+                std::printf("  pred %.1f  READY", pred);
+            else
+                std::printf("  HOLD");
+            std::printf("\n");
         }
 
         cv::Mat mask_bgr;
@@ -484,27 +619,42 @@ int main(int argc, char** argv) {
             }
         }
 
-        char text[224];
-        if (armed >= 0) {
+        // 预测位置：在圆周上画一个小方块，直观看到"打向哪"
+        if (ready) {
+            for (int half = 0; half < 2; ++half) {
+                cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
+                double a = pred * CV_PI / 180.0;
+                cv::Point2f p(wheel.x + static_cast<float>(R_px * std::cos(a)) + off.x,
+                              wheel.y + static_cast<float>(R_px * std::sin(a)) + off.y);
+                cv::drawMarker(both, p, cv::Scalar(0, 255, 255), cv::MARKER_DIAMOND, 22, 2);
+            }
+        }
+
+        char text[256];
+        if (ready) {
             std::snprintf(text, sizeof(text),
-                          "frame %d  leds %d  plates %d  ARMED %.1f  theta %.1f",
-                          idx, static_cast<int>(leds.size()),
-                          static_cast<int>(plates.size()),
-                          plates[armed].angle_deg, tracker.thetaDeg());
+                          "frame %d  plates %d  w=%.3f  rms=%.2f  pred %.1f  READY",
+                          idx, static_cast<int>(plates.size()), model.omega,
+                          model.rms * 180.0 / CV_PI, pred);
         } else {
             std::snprintf(text, sizeof(text),
-                          "frame %d  leds %d  plates %d  no unique armed  theta %.1f",
-                          idx, static_cast<int>(leds.size()),
-                          static_cast<int>(plates.size()), tracker.thetaDeg());
+                          "frame %d  plates %d  theta %.1f  HOLD",
+                          idx, static_cast<int>(plates.size()), tracker.thetaDeg());
         }
-        cv::putText(both, text, cv::Point(15, 35), cv::FONT_HERSHEY_SIMPLEX,
-                    0.72, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+        cv::putText(both, text, cv::Point(15, 35), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    ready ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255), 2,
+                    cv::LINE_AA);
 
-        // 单独一行显示连续相位（一直累加，不是折叠值）
-        char th[96];
-        std::snprintf(th, sizeof(th), "theta %+9.2f deg", tracker.thetaDeg());
-        cv::putText(both, th, cv::Point(15, 70), cv::FONT_HERSHEY_SIMPLEX,
-                    0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        char th[160];
+        if (armed >= 0) {
+            std::snprintf(th, sizeof(th), "theta %+9.2f   armed %.1f",
+                          tracker.thetaDeg(), plates[armed].angle_deg);
+        } else {
+            std::snprintf(th, sizeof(th), "theta %+9.2f   no unique armed plate",
+                          tracker.thetaDeg());
+        }
+        cv::putText(both, th, cv::Point(15, 70), cv::FONT_HERSHEY_SIMPLEX, 0.65,
+                    cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
         cv::imshow("frame | red mask", both);
         ++idx;
