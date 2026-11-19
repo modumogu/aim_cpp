@@ -78,8 +78,15 @@ constexpr double kMinAspect = 1.3;      // 长宽比，滤掉圆形的反光点
 constexpr int kSlotCount = 5;                     // 5 个靶位，间隔 72°
 constexpr double kPxPerMm = 0.8720;               // 标定得到：fx 1700 / 1950mm
 constexpr double kDefWheelRpx = 350.0 * kPxPerMm; // ≈ 305 像素
-constexpr double kGroupGapDeg = 15.0;             // 角度聚类阈值（远小于 72°）
+constexpr double kGroupGapDeg = 25.0;             // 角度聚类阈值，见下方推导
 constexpr double kRadiusTol = 0.45;               // 半径容差，±45%
+// 聚类阈值的推导（不能乱设）：
+//   灯条质心距盘心 47.5mm，盘心半径 350mm
+//   · 组内最大间隔：切向两条灯条相差 2*atan(47.5/350) = 15.46°
+//     （中间那两条径向灯没检出时，剩下的两条就隔这么远）
+//   · 组间最小间隔：72° - 15.46° = 56.54°
+//   阈值必须落在 (15.5°, 56.5°) 之间。取 25°，两边都有余量。
+//   设成 15° 会在"径向灯漏检"时把一块靶切成两半，导致整块靶丢失。
 
 // ---- 拟合参数 --------------------------------------------------------------
 constexpr double kFitWindowS = 1.5;    // 只用最近 1.5 秒的数据
@@ -584,10 +591,13 @@ int main(int argc, char** argv) {
         std::vector<Led> leds = detectLeds(mask, &raw_contours);
         std::vector<Plate> plates = assignSlots(leds, wheel, R_px);
 
+        // 待激活靶必须唯一
+        // 用 >= 4 而不是 == 4：噪点可能让一块靶聚出 5 条灯，
+        // Python 版也是 n >= armed_bars，不能写死成等于。
         int armed = -1;
         int armed_count = 0;
         for (size_t k = 0; k < plates.size(); ++k) {
-            if (plates[k].state == 4) {
+            if (plates[k].state >= 4) {
                 if (armed < 0) armed = static_cast<int>(k);
                 ++armed_count;
             }
