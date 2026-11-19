@@ -425,6 +425,7 @@ int main(int argc, char** argv) {
 
     bool use_camera = true;
     bool headless = false;
+    bool show_raw = false;      // 纯相机画面（按 p 切换）
     int want_index = -1;
     int max_frames = 1;
     double exposure = kDefExposure;
@@ -455,6 +456,8 @@ int main(int argc, char** argv) {
             save_path = argv[++i];
         } else if (a == "--frames" && i + 1 < argc) {
             max_frames = std::stoi(argv[++i]);
+        } else if (a == "--raw") {
+            show_raw = true;        // 启动时就是纯相机画面
         }
     }
 
@@ -494,10 +497,27 @@ int main(int argc, char** argv) {
     if (fps <= 1.0) fps = 30.0;
     const double t_start = cv::getTickCount() / cv::getTickFrequency();
 
+    // 实测帧率（驱动报的 fps 不一定准，尤其相机被抢带宽的时候）
+    double fps_shown = 0.0;
+    int frames_since = 0;
+    double fps_t0 = cv::getTickCount() / cv::getTickFrequency();
+    bool raw_window_open = false;
+
     while (true) {
         cv::Mat frame;
         cap >> frame;
         if (frame.empty()) break;
+
+        // 实测帧率：每 0.5 秒刷新一次
+        ++frames_since;
+        {
+            const double now = cv::getTickCount() / cv::getTickFrequency();
+            if (now - fps_t0 >= 0.5) {
+                fps_shown = frames_since / (now - fps_t0);
+                frames_since = 0;
+                fps_t0 = now;
+            }
+        }
 
         if (!wheel_set) {
             if (wheel_x < 0 || wheel_y < 0) {
@@ -645,6 +665,15 @@ int main(int argc, char** argv) {
                     ready ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255), 2,
                     cv::LINE_AA);
 
+        // 实测帧率：掉到 50 以下通常是被别的 USB 设备抢了带宽
+        char fz[96];
+        std::snprintf(fz, sizeof(fz), "fps %.1f  %s", fps_shown,
+                      (fps_shown > 0.0 && fps_shown < 50.0) ? "(LOW!)" : "");
+        cv::putText(both, fz, cv::Point(15, 105), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    (fps_shown > 0.0 && fps_shown < 50.0) ? cv::Scalar(0, 0, 255)
+                                                          : cv::Scalar(200, 255, 200),
+                    2, cv::LINE_AA);
+
         char th[160];
         if (armed >= 0) {
             std::snprintf(th, sizeof(th), "theta %+9.2f   armed %.1f",
@@ -656,7 +685,25 @@ int main(int argc, char** argv) {
         cv::putText(both, th, cv::Point(15, 70), cv::FONT_HERSHEY_SIMPLEX, 0.65,
                     cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
-        cv::imshow("frame | red mask", both);
+        // ---- 显示 ----
+        //   默认显示"原图 | 掩膜"复合画面
+        //   按 p 切到纯相机画面（比赛/录像时用，就看镜头拍到什么）
+        if (!headless) {
+            if (show_raw) {
+                if (!raw_window_open) {
+                    cv::namedWindow("camera", cv::WINDOW_NORMAL);
+                    cv::resizeWindow("camera", 960, 768);
+                    raw_window_open = true;
+                }
+                cv::imshow("camera", frame);        // 纯画面，不叠任何东西
+            } else {
+                if (raw_window_open) {
+                    cv::destroyWindow("camera");
+                    raw_window_open = false;
+                }
+                cv::imshow("frame | red mask", both);
+            }
+        }
         ++idx;
 
         if (headless) {
@@ -670,6 +717,13 @@ int main(int argc, char** argv) {
 
         int key = cv::waitKey(1) & 0xFF;
         if (key == 27 || key == 'q') break;
+        if (key == 'p' || key == 'P') show_raw = !show_raw;
+        if (key == 's' || key == 'S') {          // 按 s 存一张当前画面
+            char name[64];
+            std::snprintf(name, sizeof(name), "shot_%04d.png", idx);
+            cv::imwrite(name, show_raw ? frame : both);
+            std::cout << "已截图 " << name << "\n";
+        }
     }
 
     cap.release();
