@@ -28,6 +28,22 @@
 //      · 合成数据集：w 落在 1.88~2.00，rms < 0.05°，状态 READY
 //      · 与 truth.csv 的"100ms 后靶角"对比，误差 < 0.2°
 //
+// ----------------------------------------------------------------------------
+//  命令行参数
+//      aim.exe                                自动挑相机（默认红色灯条）
+//      aim.exe --color blue                   蓝色灯条（比赛分边随机，必须能切）
+//      aim.exe --color yellow                 黄色灯条
+//      aim.exe --index 1                      强制某个索引的相机
+//      aim.exe --expo -6                      曝光（-8 最暗，值越大越亮）
+//      aim.exe --wb 4600                      色温
+//      aim.exe --wheel 640 480                转盘圆心
+//      aim.exe --rpx 305                      转盘半径（像素）
+//      aim.exe --raw                          启动即纯相机画面
+//      aim.exe --video xxx.mp4                用视频文件
+//      aim.exe --video xxx.mp4 --save out.png 不弹窗，存一张图
+//
+//  按键：ESC/q 退出    p 切纯相机画面    s 截图
+//
 // ============================================================================
 
 #include <opencv2/opencv.hpp>
@@ -81,20 +97,33 @@ struct HsvRange {
     cv::Scalar hi;
 };
 
-const HsvRange kRedRanges[] = {
-    {cv::Scalar(0, 120, 120), cv::Scalar(10, 255, 255)},
-    {cv::Scalar(170, 120, 120), cv::Scalar(179, 255, 255)},
-};
+// 三种颜色各自的 HSV 区间。
+//   红色：H 跨 0 和 179 两端，必须两段
+//   蓝色：H≈120 一段就行
+//   黄色：H≈30 一段；实测黄色 LED 饱和度偏低（S≈73），所以 S 下限放到 50
+// 比赛分边是随机的，红蓝都要能用，所以必须可切换而不是写死。
+std::vector<HsvRange> rangesForColor(const std::string& color) {
+    std::vector<HsvRange> v;
+    if (color == "blue") {
+        v.push_back({cv::Scalar(100, 120, 120), cv::Scalar(130, 255, 255)});
+    } else if (color == "yellow") {
+        v.push_back({cv::Scalar(15, 50, 150), cv::Scalar(45, 255, 255)});
+    } else {   // red（默认）
+        v.push_back({cv::Scalar(0, 120, 120), cv::Scalar(10, 255, 255)});
+        v.push_back({cv::Scalar(170, 120, 120), cv::Scalar(179, 255, 255)});
+    }
+    return v;
+}
 
 // ============================================================================
 //  ① 颜色掩膜
 // ============================================================================
-cv::Mat buildRedMask(const cv::Mat& bgr) {
+cv::Mat buildMask(const cv::Mat& bgr, const std::vector<HsvRange>& ranges) {
     cv::Mat hsv;
     cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
 
     cv::Mat mask = cv::Mat::zeros(hsv.size(), CV_8UC1);
-    for (const auto& r : kRedRanges) {
+    for (const auto& r : ranges) {
         cv::Mat m;
         cv::inRange(hsv, r.lo, r.hi, m);
         cv::bitwise_or(mask, m, mask);
@@ -433,6 +462,7 @@ int main(int argc, char** argv) {
     double wheel_x = -1.0;
     double wheel_y = -1.0;
     double R_px = kDefWheelRpx;
+    std::string color = "red";      // red / blue / yellow
     std::string video_path, save_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -458,6 +488,8 @@ int main(int argc, char** argv) {
             max_frames = std::stoi(argv[++i]);
         } else if (a == "--raw") {
             show_raw = true;        // 启动时就是纯相机画面
+        } else if (a == "--color" && i + 1 < argc) {
+            color = argv[++i];
         }
     }
 
@@ -484,7 +516,15 @@ int main(int argc, char** argv) {
               << "   帧率 " << cap.get(cv::CAP_PROP_FPS)
               << "   曝光 " << cap.get(cv::CAP_PROP_EXPOSURE)
               << "   色温 " << cap.get(cv::CAP_PROP_WB_TEMPERATURE) << "\n";
-    std::cout << "ESC / q 退出\n";
+
+    // 颜色：比赛分边随机，红蓝都要能用
+    const std::vector<HsvRange> ranges = rangesForColor(color);
+    std::cout << "灯条颜色 " << color << "（" << ranges.size() << " 段 HSV 区间）\n";
+    if (color != "red" && color != "blue" && color != "yellow") {
+        std::cout << "[WARN] 未知颜色 \"" << color << "\"，已按红色处理\n";
+    }
+
+    std::cout << "按键：ESC/q 退出   p 切纯相机画面   s 截图\n";
 
     int idx = 0;
     bool warned_dark = false;
@@ -502,6 +542,7 @@ int main(int argc, char** argv) {
     int frames_since = 0;
     double fps_t0 = cv::getTickCount() / cv::getTickFrequency();
     bool raw_window_open = false;
+    const std::string win_name = "aim | " + color + " | frame+mask";
 
     while (true) {
         cv::Mat frame;
@@ -538,7 +579,7 @@ int main(int argc, char** argv) {
             warned_dark = true;
         }
 
-        cv::Mat mask = buildRedMask(frame);
+        cv::Mat mask = buildMask(frame, ranges);
         int raw_contours = 0;
         std::vector<Led> leds = detectLeds(mask, &raw_contours);
         std::vector<Plate> plates = assignSlots(leds, wheel, R_px);
@@ -666,8 +707,9 @@ int main(int argc, char** argv) {
                     cv::LINE_AA);
 
         // 实测帧率：掉到 50 以下通常是被别的 USB 设备抢了带宽
-        char fz[96];
-        std::snprintf(fz, sizeof(fz), "fps %.1f  %s", fps_shown,
+        char fz[128];
+        std::snprintf(fz, sizeof(fz), "color %s   fps %.1f  %s", color.c_str(),
+                      fps_shown,
                       (fps_shown > 0.0 && fps_shown < 50.0) ? "(LOW!)" : "");
         cv::putText(both, fz, cv::Point(15, 105), cv::FONT_HERSHEY_SIMPLEX, 0.7,
                     (fps_shown > 0.0 && fps_shown < 50.0) ? cv::Scalar(0, 0, 255)
@@ -701,7 +743,7 @@ int main(int argc, char** argv) {
                     cv::destroyWindow("camera");
                     raw_window_open = false;
                 }
-                cv::imshow("frame | red mask", both);
+                cv::imshow(win_name, both);
             }
         }
         ++idx;
