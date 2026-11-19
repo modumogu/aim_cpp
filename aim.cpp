@@ -1,35 +1,41 @@
 // ============================================================================
-//  ROBOMINI 能量机关自瞄 —— 节点 2：轮廓过滤 + 质心
+//  ROBOMINI 能量机关自瞄 —— 节点 3：槽位归组
 // ============================================================================
 //
-//  在节点 1（颜色掩膜）的基础上，把掩膜里的白色块变成"点"：
-//      掩膜 -> findContours -> 面积/长宽比过滤 -> moments 求质心
+//  节点 2 拿到的是"一堆孤立的点"，这一节点把它变成"哪几块靶、每块几条灯、在什么角度"。
 //
-//  为什么要过滤：
-//      · 面积太小  -> 噪点、反光
-//      · 面积太大  -> 整片光斑、被照亮的墙面
-//      · 长宽比太方 -> 圆形光斑，不是灯条
+//  思路（不依赖转盘当前转到哪，所以转起来也能用）：
+//      1. 以转盘圆心为原点，算每个灯条的角度和半径
+//      2. 半径偏离 R 超过 45% 的丢掉（不是靶上的灯）
+//      3. 按角度排序，挨得小于 15° 的归成一组 —— 一组就是一块靶
+//      4. 组内灯条数 = 这块靶的状态：4 条待激活，2 条已激活
+//      5. 组内质心的平均 = 靶中心，它的角度就是这块靶的角度
+//
+//  两个几何参数：
+//      wheel  —— 转盘圆心在图像里的位置。默认用画面正中心。
+//                真机必须换成实测值（相机怎么装、云台朝哪决定它），用 --wheel x y 覆盖。
+//      R_px   —— 转盘半径 350mm 对应多少像素。默认 305（fx=1700、距离 1950mm）。
+//                距离或焦距变了就要重算，用 --rpx 覆盖。
 //
 //  用法：
-//      aim.exe                                自动挑相机
-//      aim.exe --index 1                      强制某个索引
-//      aim.exe --expo -6                      曝光（-8 最暗，值越大越亮）
-//      aim.exe --wb 4600                      色温
-//      aim.exe --video xxx.mp4                用视频文件
-//      aim.exe --video xxx.mp4 --save out.png 不弹窗，存一张图
+//      aim.exe                                  自动挑相机（轮心=画面中心，R=305）
+//      aim.exe --wheel 640 480                  指定轮心
+//      aim.exe --rpx 300                        指定半径（像素）
+//      aim.exe --expo -6                        曝光
+//      aim.exe --video xxx.mp4                  用视频
 //
 //  按键：ESC 或 q 退出
 //
 //  验证标准：
-//      · 合成数据集 red_var  -> "灯条 4"，画面上 4 个绿圈套在 4 条灯上
-//      · 纯红屏幕（整块）    -> "灯条 0"（面积 25 万像素，被上限滤掉，正常）
-//      · 桌面杂物            -> "灯条 0"（没有细长的红色块）
+//      · 合成数据集  -> "靶 1  armed <角度>"，角度随时间单调变化
+//      · 画面上 5 条灰射线 = 5 个槽位，蓝圈 = 靶，红圈 = 待激活靶
 //
 // ============================================================================
 
 #include <opencv2/opencv.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -49,14 +55,19 @@ constexpr double kDefExposure = -8; // DirectShow 的 log2 刻度，-8 ≈ 3.9ms
 constexpr double kDefWbTemp = 4600; // 手动色温，必须关自动白平衡
 
 // ---- 灯条形状的物理范围（1280x1024、2 米距离下的经验值）---------------------
-// 灯条实测：宽 6~7 px，长 40~70 px，面积 300~800 px²
 constexpr double kMinLedArea = 20.0;    // 小于这个：噪点
 constexpr double kMaxLedArea = 2500.0;  // 大于这个：光斑 / 整片红色
 constexpr double kMinAspect = 1.3;      // 长宽比，滤掉圆形的反光点
 
+// ---- 转盘几何 --------------------------------------------------------------
+constexpr int kSlotCount = 5;                     // 5 个靶位，间隔 72°
+constexpr double kPxPerMm = 0.8720;               // 标定得到：fx 1700 / 1950mm
+constexpr double kDefWheelRpx = 350.0 * kPxPerMm; // ≈ 305 像素
+constexpr double kGroupGapDeg = 15.0;             // 角度聚类阈值（远小于 72°）
+constexpr double kRadiusTol = 0.45;               // 半径容差，±45%
+
 // ---- 颜色阈值 --------------------------------------------------------------
 // 红色在 HSV 的 H 上跨 0 和 179 两端，所以要两段。
-// S/V 下限 120：既滤掉灰白的背景，又不会漏掉灯条。
 struct HsvRange {
     cv::Scalar lo;
     cv::Scalar hi;
@@ -69,7 +80,6 @@ const HsvRange kRedRanges[] = {
 
 // ============================================================================
 //  ① 颜色掩膜
-//      BGR -> HSV -> 两段 inRange -> 位或合成 -> 3x3 椭圆开运算
 // ============================================================================
 cv::Mat buildRedMask(const cv::Mat& bgr) {
     cv::Mat hsv;
@@ -79,17 +89,16 @@ cv::Mat buildRedMask(const cv::Mat& bgr) {
     for (const auto& r : kRedRanges) {
         cv::Mat m;
         cv::inRange(hsv, r.lo, r.hi, m);
-        cv::bitwise_or(mask, m, mask);      // C++ 的 bitwise_or 写进第三个参数
+        cv::bitwise_or(mask, m, mask);
     }
 
-    // 3x3 椭圆开运算去孤立噪点。灯条只有 6~7 像素宽，核不能大。
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
     return mask;
 }
 
 // ============================================================================
-//  ② 灯条：一条灯（可能是一块靶上的 4 条之一）
+//  ② 灯条
 // ============================================================================
 struct Led {
     cv::Point2f center;
@@ -97,40 +106,23 @@ struct Led {
     double aspect = 0.0;
 };
 
-// ============================================================================
-//  ②③ 轮廓过滤 + 质心
-//
-//      raw_count 回传"过滤前有多少个轮廓"，用来区分
-//      "根本找不到东西" 和 "找到了但都被形状条件刷掉"。
-// ============================================================================
 std::vector<Led> detectLeds(const cv::Mat& mask, int* raw_count) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (raw_count) *raw_count = static_cast<int>(contours.size());
 
     std::vector<Led> leds;
-    leds.reserve(contours.size());
-
     for (const auto& c : contours) {
-        // --- 面积过滤 ---
         double area = cv::contourArea(c);
-        if (area < kMinLedArea || area > kMaxLedArea) {
-            continue;
-        }
+        if (area < kMinLedArea || area > kMaxLedArea) continue;
 
-        // --- 长宽比过滤：灯条一定是"细长"的 ---
         cv::RotatedRect rr = cv::minAreaRect(c);
         double w = rr.size.width, h = rr.size.height;
         double lo = std::min(w, h), hi = std::max(w, h);
         if (lo <= 0.0) continue;
         double aspect = hi / lo;
-        if (aspect < kMinAspect) {
-            continue;
-        }
+        if (aspect < kMinAspect) continue;
 
-        // --- 质心：用一阶矩 / 零阶矩 ---
-        //     binaryImage 默认 false，但这里传的是轮廓不是灰度图，
-        //     等价于把轮廓内部当作权重 1，和 Python 版一致。
         cv::Moments M = cv::moments(c);
         if (M.m00 <= 0.0) continue;
 
@@ -145,9 +137,92 @@ std::vector<Led> detectLeds(const cv::Mat& mask, int* raw_count) {
 }
 
 // ============================================================================
+//  ④ 槽位归组
+// ============================================================================
+struct Plate {
+    std::vector<int> bars;   // 属于这块靶的灯条下标
+    cv::Point2f center;      // 靶中心（像素）
+    double angle_deg = 0.0;  // 相对转盘圆心的角度 [0, 360)
+    int state = 0;           // 4 = 待激活，2 = 已激活
+};
+
+std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
+                               double R_px) {
+    // --- 1. 每个灯条的角度 + 半径，半径不对的丢掉 ---
+    struct Item {
+        int idx;
+        double ang;
+    };
+    std::vector<Item> items;
+    for (int i = 0; i < static_cast<int>(leds.size()); ++i) {
+        cv::Point2f d = leds[i].center - wheel;
+        double r = std::hypot(d.x, d.y);
+        if (std::fabs(r - R_px) > kRadiusTol * R_px) continue;
+        double a = std::atan2(d.y, d.x) * 180.0 / CV_PI;
+        if (a < 0.0) a += 360.0;
+        items.push_back({i, a});
+    }
+    if (items.empty()) return {};
+
+    // --- 2. 按角度排序 ---
+    std::sort(items.begin(), items.end(),
+              [](const Item& a, const Item& b) { return a.ang < b.ang; });
+
+    // --- 3. 在最大角度空隙处"剪开"，避免 0°/360° 交界被切成两块靶 ---
+    int cut = 0;
+    double max_gap = -1.0;
+    for (size_t k = 0; k < items.size(); ++k) {
+        double cur = items[k].ang;
+        double nxt = (k + 1 < items.size()) ? items[k + 1].ang : items[0].ang + 360.0;
+        if (nxt - cur > max_gap) {
+            max_gap = nxt - cur;
+            cut = static_cast<int>((k + 1) % items.size());
+        }
+    }
+    std::rotate(items.begin(), items.begin() + cut, items.end());
+
+    // 展开成单调递增，之后减出来才是正的角度差
+    double base = items[0].ang;
+    for (auto& it : items) {
+        if (it.ang < base) it.ang += 360.0;
+    }
+
+    // --- 4. 线性聚簇 ---
+    std::vector<Plate> plates;
+    std::vector<Item> cur{items[0]};
+    auto flush = [&]() {
+        if (cur.size() >= 2) {
+            Plate p;
+            cv::Point2f c(0.0f, 0.0f);
+            for (const auto& it : cur) {
+                p.bars.push_back(it.idx);
+                c += leds[it.idx].center;
+            }
+            c *= 1.0f / static_cast<float>(cur.size());
+            p.center = c;
+            cv::Point2f d = c - wheel;
+            double a = std::atan2(d.y, d.x) * 180.0 / CV_PI;
+            if (a < 0.0) a += 360.0;
+            p.angle_deg = a;
+            p.state = static_cast<int>(cur.size());
+            plates.push_back(p);
+        }
+        cur.clear();
+    };
+    for (size_t k = 1; k < items.size(); ++k) {
+        if (items[k].ang - items[k - 1].ang < kGroupGapDeg) {
+            cur.push_back(items[k]);
+        } else {
+            flush();
+            cur.push_back(items[k]);
+        }
+    }
+    flush();
+    return plates;
+}
+
+// ============================================================================
 //  打开相机
-//      笔记本内置摄像头通常是索引 0、最高 640x480；USB 工业相机在后面。
-//      所以逐个试，谁能给出 1280x1024 就用谁。
 // ============================================================================
 int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double wb_temp) {
     for (int idx = 0; idx < 5; ++idx) {
@@ -162,9 +237,9 @@ int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double w
         cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'));
         cap.set(cv::CAP_PROP_FRAME_WIDTH, kWantW);
         cap.set(cv::CAP_PROP_FRAME_HEIGHT, kWantH);
-        cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);      // 关自动曝光
+        cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);
         cap.set(cv::CAP_PROP_EXPOSURE, exposure);
-        cap.set(cv::CAP_PROP_AUTO_WB, 0);               // 关自动白平衡（关键！）
+        cap.set(cv::CAP_PROP_AUTO_WB, 0);
         cap.set(cv::CAP_PROP_WB_TEMPERATURE, wb_temp);
 
         cv::Mat probe;
@@ -184,7 +259,6 @@ int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double w
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
-    // 源码是 UTF-8，控制台默认 GBK，不设这个中文输出就是乱码
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
@@ -194,6 +268,9 @@ int main(int argc, char** argv) {
     int max_frames = 1;
     double exposure = kDefExposure;
     double wb_temp = kDefWbTemp;
+    double wheel_x = -1.0;       // -1 表示"用画面中心"
+    double wheel_y = -1.0;
+    double R_px = kDefWheelRpx;
     std::string video_path, save_path;
 
     for (int i = 1; i < argc; ++i) {
@@ -207,6 +284,11 @@ int main(int argc, char** argv) {
             exposure = std::stod(argv[++i]);
         } else if (a == "--wb" && i + 1 < argc) {
             wb_temp = std::stod(argv[++i]);
+        } else if (a == "--wheel" && i + 2 < argc) {
+            wheel_x = std::stod(argv[++i]);
+            wheel_y = std::stod(argv[++i]);
+        } else if (a == "--rpx" && i + 1 < argc) {
+            R_px = std::stod(argv[++i]);
         } else if (a == "--save" && i + 1 < argc) {
             headless = true;
             save_path = argv[++i];
@@ -242,13 +324,27 @@ int main(int argc, char** argv) {
 
     int idx = 0;
     bool warned_dark = false;
+    cv::Point2f wheel(0.0f, 0.0f);
+    bool wheel_set = false;
 
     while (true) {
         cv::Mat frame;
         cap >> frame;
-        if (frame.empty()) break;   // 视频放完
+        if (frame.empty()) break;
 
-        // 画面太黑时提醒一次（曝光太短 / 镜头盖 / 环境太暗）
+        // 轮心：默认画面正中心（第一帧时才确定尺寸）
+        if (!wheel_set) {
+            if (wheel_x < 0 || wheel_y < 0) {
+                wheel = cv::Point2f(frame.cols * 0.5f, frame.rows * 0.5f);
+            } else {
+                wheel = cv::Point2f(static_cast<float>(wheel_x),
+                                    static_cast<float>(wheel_y));
+            }
+            wheel_set = true;
+            std::cout << "轮心 (" << wheel.x << ", " << wheel.y
+                      << ")   半径 " << R_px << " px\n";
+        }
+
         if (!warned_dark && cv::mean(frame)[0] < 5.0) {
             std::cout << "[WARN] 画面几乎全黑（平均灰度 < 5）\n"
                          "       可能原因：曝光太短 / 镜头盖没摘 / 环境太暗\n"
@@ -257,42 +353,91 @@ int main(int argc, char** argv) {
         }
 
         cv::Mat mask = buildRedMask(frame);
-
         int raw_contours = 0;
         std::vector<Led> leds = detectLeds(mask, &raw_contours);
+        std::vector<Plate> plates = assignSlots(leds, wheel, R_px);
+
+        // 待激活靶必须唯一，否则不知道打哪个
+        int armed = -1;
+        int armed_count = 0;
+        for (size_t k = 0; k < plates.size(); ++k) {
+            if (plates[k].state == 4) {
+                if (armed < 0) armed = static_cast<int>(k);
+                ++armed_count;
+            }
+        }
+        if (armed_count != 1) armed = -1;
 
         if (idx % 30 == 0) {
             std::cout << "frame " << idx
-                      << "  轮廓 " << raw_contours
-                      << "  灯条 " << leds.size() << "\n";
+                      << "  灯条 " << leds.size()
+                      << "  靶 " << plates.size();
+            if (armed >= 0) {
+                std::cout << "  待激活角度 " << plates[armed].angle_deg;
+            } else if (armed_count > 1) {
+                std::cout << "  (待激活靶不唯一)";
+            }
+            std::cout << "\n";
         }
 
         cv::Mat mask_bgr;
         cv::cvtColor(mask, mask_bgr, cv::COLOR_GRAY2BGR);
         cv::Mat both;
-        cv::hconcat(frame, mask_bgr, both);     // 左：原图   右：掩膜
+        cv::hconcat(frame, mask_bgr, both);
 
-        // 在原图和掩膜两边都画质心，方便对照"看到的就是找到的"
+        // 灯条质心
         for (size_t k = 0; k < leds.size(); ++k) {
             const cv::Point2f& p = leds[k].center;
-            cv::circle(both, p, 6, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-            cv::circle(both, p + cv::Point2f(static_cast<float>(kWantW), 0.0f), 6,
-                       cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-
-            char tag[16];
-            std::snprintf(tag, sizeof(tag), "%d", static_cast<int>(k));
-            cv::putText(both, tag, p + cv::Point2f(9, -9),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.6,
-                        cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            cv::circle(both, p, 5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            cv::circle(both, p + cv::Point2f(static_cast<float>(frame.cols), 0.0f),
+                       5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
         }
 
-        char text[160];
-        std::snprintf(text, sizeof(text),
-                      "frame %d   leds %d   contours %d   mask %d",
-                      idx, static_cast<int>(leds.size()), raw_contours,
-                      cv::countNonZero(mask));
+        // 轮心 + 半径圆 + 5 条槽位射线
+        for (int half = 0; half < 2; ++half) {
+            cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
+            cv::Point2f wc = wheel + off;
+            cv::drawMarker(both, wc, cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 24, 2);
+            cv::circle(both, wc, static_cast<int>(R_px), cv::Scalar(90, 90, 90), 1,
+                       cv::LINE_AA);
+            for (int s = 0; s < kSlotCount; ++s) {
+                double a = s * (360.0 / kSlotCount) * CV_PI / 180.0;
+                cv::Point2f e(wc.x + static_cast<float>(R_px * std::cos(a)),
+                              wc.y + static_cast<float>(R_px * std::sin(a)));
+                cv::line(both, wc, e, cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
+            }
+        }
+
+        // 每块靶
+        for (size_t k = 0; k < plates.size(); ++k) {
+            bool is_armed = (static_cast<int>(k) == armed);
+            cv::Scalar col = is_armed ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 160, 0);
+            for (int half = 0; half < 2; ++half) {
+                cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
+                cv::Point2f c = plates[k].center + off;
+                cv::circle(both, c, 14, col, 2, cv::LINE_AA);
+                char tag[64];
+                std::snprintf(tag, sizeof(tag), "%d bars %.1f",
+                              plates[k].state, plates[k].angle_deg);
+                cv::putText(both, tag, c + cv::Point2f(16, 6),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv::LINE_AA);
+            }
+        }
+
+        char text[192];
+        if (armed >= 0) {
+            std::snprintf(text, sizeof(text),
+                          "frame %d  leds %d  plates %d  ARMED %.1f deg",
+                          idx, static_cast<int>(leds.size()),
+                          static_cast<int>(plates.size()), plates[armed].angle_deg);
+        } else {
+            std::snprintf(text, sizeof(text),
+                          "frame %d  leds %d  plates %d  no unique armed plate",
+                          idx, static_cast<int>(leds.size()),
+                          static_cast<int>(plates.size()));
+        }
         cv::putText(both, text, cv::Point(15, 35), cv::FONT_HERSHEY_SIMPLEX,
-                    0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+                    0.75, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
 
         cv::imshow("frame | red mask", both);
         ++idx;
