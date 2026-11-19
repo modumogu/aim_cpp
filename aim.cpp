@@ -1,34 +1,30 @@
 // ============================================================================
-//  ROBOMINI 能量机关自瞄 —— 节点 3：槽位归组
+//  ROBOMINI 能量机关自瞄 —— 节点 4：相位解缠（mod 72°）
 // ============================================================================
 //
-//  节点 2 拿到的是"一堆孤立的点"，这一节点把它变成"哪几块靶、每块几条灯、在什么角度"。
+//  节点 3 得到的是"每块靶各自的角度"，但它们都等于 θ + k×72°。
+//  这一节点把它们合成一个数：转盘转了多少（θ）。
 //
-//  思路（不依赖转盘当前转到哪，所以转起来也能用）：
-//      1. 以转盘圆心为原点，算每个灯条的角度和半径
-//      2. 半径偏离 R 超过 45% 的丢掉（不是靶上的灯）
-//      3. 按角度排序，挨得小于 15° 的归成一组 —— 一组就是一块靶
-//      4. 组内灯条数 = 这块靶的状态：4 条待激活，2 条已激活
-//      5. 组内质心的平均 = 靶中心，它的角度就是这块靶的角度
+//  两步：
+//      ① 乘 5 消掉槽位号 —— estimatePhase()
+//         5 块靶的方位角分别是 θ+0×72°、θ+1×72°、…、θ+4×72°
+//         角度乘 5 后，k×72°×5 = k×360° 全部绕回原点，只剩 5θ
+//         所有靶乘 5 后做向量平均，再除以 5，就得到 θ mod 72°
 //
-//  两个几何参数：
-//      wheel  —— 转盘圆心在图像里的位置。默认用画面正中心。
-//                真机必须换成实测值（相机怎么装、云台朝哪决定它），用 --wheel x y 覆盖。
-//      R_px   —— 转盘半径 350mm 对应多少像素。默认 305（fx=1700、距离 1950mm）。
-//                距离或焦距变了就要重算，用 --rpx 覆盖。
+//      ② 折叠累加成连续角度 —— PhaseTracker
+//         mod 72° 的值每转 72° 就跳一次，没法直接拟合。
+//         把相邻两帧之差折叠到 ±半个槽，得到"这一帧转了多少"，累加起来。
+//         单帧转动超过 0.8 个槽（约 57.6°）物理上不可能，当这帧无效。
 //
-//  用法：
-//      aim.exe                                  自动挑相机（轮心=画面中心，R=305）
-//      aim.exe --wheel 640 480                  指定轮心
-//      aim.exe --rpx 300                        指定半径（像素）
-//      aim.exe --expo -6                        曝光
-//      aim.exe --video xxx.mp4                  用视频
+//  为什么第 ② 步的"跳变拒绝"这么重要：
+//      如果某帧把靶认错成隔壁那块，原始相位会瞬间跳 72°。
+//      不作废它，θ 就永久偏了 72°，之后所有预测全废。
 //
-//  按键：ESC 或 q 退出
+//  用法：同节点 3
 //
 //  验证标准：
-//      · 合成数据集  -> "靶 1  armed <角度>"，角度随时间单调变化
-//      · 画面上 5 条灰射线 = 5 个槽位，蓝圈 = 靶，红圈 = 待激活靶
+//      · 合成数据集：theta 连续递增（10° → 44° → 133° → 234°），不在 72° 处回落
+//      · 与 truth.csv 的 theta 对比，误差应 < 0.1°
 //
 // ============================================================================
 
@@ -137,7 +133,7 @@ std::vector<Led> detectLeds(const cv::Mat& mask, int* raw_count) {
 }
 
 // ============================================================================
-//  ④ 槽位归组
+//  ③ 槽位归组
 // ============================================================================
 struct Plate {
     std::vector<int> bars;   // 属于这块靶的灯条下标
@@ -148,7 +144,6 @@ struct Plate {
 
 std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
                                double R_px) {
-    // --- 1. 每个灯条的角度 + 半径，半径不对的丢掉 ---
     struct Item {
         int idx;
         double ang;
@@ -164,11 +159,10 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
     }
     if (items.empty()) return {};
 
-    // --- 2. 按角度排序 ---
     std::sort(items.begin(), items.end(),
               [](const Item& a, const Item& b) { return a.ang < b.ang; });
 
-    // --- 3. 在最大角度空隙处"剪开"，避免 0°/360° 交界被切成两块靶 ---
+    // 在最大角度空隙处剪开，避免 0°/360° 交界被切成两块靶
     int cut = 0;
     double max_gap = -1.0;
     for (size_t k = 0; k < items.size(); ++k) {
@@ -181,13 +175,11 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
     }
     std::rotate(items.begin(), items.begin() + cut, items.end());
 
-    // 展开成单调递增，之后减出来才是正的角度差
     double base = items[0].ang;
     for (auto& it : items) {
         if (it.ang < base) it.ang += 360.0;
     }
 
-    // --- 4. 线性聚簇 ---
     std::vector<Plate> plates;
     std::vector<Item> cur{items[0]};
     auto flush = [&]() {
@@ -220,6 +212,69 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
     flush();
     return plates;
 }
+
+// ============================================================================
+//  ④ 相位解缠
+// ============================================================================
+
+// ① 乘 5 消掉槽位号：(θ + k×72°) × 5 = 5θ + k×360° ≡ 5θ
+bool estimatePhase(const std::vector<Plate>& plates, double* raw_out) {
+    if (plates.empty()) return false;
+
+    double sx = 0.0, sy = 0.0;
+    for (const auto& p : plates) {
+        double a = p.angle_deg * CV_PI / 180.0;   // 转成弧度再乘 5
+        sx += std::cos(kSlotCount * a);
+        sy += std::sin(kSlotCount * a);
+    }
+    // 向量互相抵消 -> 方向不可信（比如只剩一块靶、或者分布太乱）
+    if (std::hypot(sx, sy) < 1e-6) return false;
+
+    *raw_out = std::atan2(sy, sx) / kSlotCount;   // 弧度，落在 (-36°, +36°]
+    return true;
+}
+
+// ② 折叠累加成连续角度，并拒绝可疑帧（防 72° 滑移）
+class PhaseTracker {
+public:
+    explicit PhaseTracker(int slot_count) : half_slot_(CV_PI / slot_count) {}
+
+    double update(bool has_raw, double raw) {
+        if (!has_raw) return theta_;
+
+        if (!has_theta_) {          // 第一帧：直接作为起点
+            theta_ = raw;
+            last_raw_ = raw;
+            has_theta_ = true;
+            return theta_;
+        }
+
+        // 把两帧之差折叠到 ±半个槽：这才是"这一帧到底转了多少"
+        const double two = 2.0 * half_slot_;
+        double d = std::fmod(raw - last_raw_ + half_slot_, two);
+        if (d < 0.0) d += two;
+        d -= half_slot_;
+
+        // 一帧转超过 0.8 个槽（约 57.6°）——物理上不可能，当这帧无效
+        if (std::fabs(d) > 0.8 * half_slot_) {
+            return theta_;
+        }
+
+        theta_ += d;
+        last_raw_ = raw;
+        return theta_;
+    }
+
+    bool has() const { return has_theta_; }
+    double theta() const { return theta_; }
+    double thetaDeg() const { return theta_ * 180.0 / CV_PI; }
+
+private:
+    double half_slot_;
+    double theta_ = 0.0;
+    double last_raw_ = 0.0;
+    bool has_theta_ = false;
+};
 
 // ============================================================================
 //  打开相机
@@ -326,13 +381,13 @@ int main(int argc, char** argv) {
     bool warned_dark = false;
     cv::Point2f wheel(0.0f, 0.0f);
     bool wheel_set = false;
+    PhaseTracker tracker(kSlotCount);
 
     while (true) {
         cv::Mat frame;
         cap >> frame;
         if (frame.empty()) break;
 
-        // 轮心：默认画面正中心（第一帧时才确定尺寸）
         if (!wheel_set) {
             if (wheel_x < 0 || wheel_y < 0) {
                 wheel = cv::Point2f(frame.cols * 0.5f, frame.rows * 0.5f);
@@ -357,7 +412,7 @@ int main(int argc, char** argv) {
         std::vector<Led> leds = detectLeds(mask, &raw_contours);
         std::vector<Plate> plates = assignSlots(leds, wheel, R_px);
 
-        // 待激活靶必须唯一，否则不知道打哪个
+        // 待激活靶必须唯一
         int armed = -1;
         int armed_count = 0;
         for (size_t k = 0; k < plates.size(); ++k) {
@@ -368,14 +423,22 @@ int main(int argc, char** argv) {
         }
         if (armed_count != 1) armed = -1;
 
+        // ---- ④ 相位解缠 ----
+        double raw_phase = 0.0;
+        bool has_phase = estimatePhase(plates, &raw_phase);
+        tracker.update(has_phase, raw_phase);
+        double theta = tracker.theta();
+
         if (idx % 30 == 0) {
             std::cout << "frame " << idx
                       << "  灯条 " << leds.size()
                       << "  靶 " << plates.size();
             if (armed >= 0) {
                 std::cout << "  待激活角度 " << plates[armed].angle_deg;
-            } else if (armed_count > 1) {
-                std::cout << "  (待激活靶不唯一)";
+            }
+            if (tracker.has()) {
+                std::printf("  theta %.2f (mod72 %+.1f)", theta * 180.0 / CV_PI,
+                            std::fmod(theta * 180.0 / CV_PI, 72.0));
             }
             std::cout << "\n";
         }
@@ -385,7 +448,6 @@ int main(int argc, char** argv) {
         cv::Mat both;
         cv::hconcat(frame, mask_bgr, both);
 
-        // 灯条质心
         for (size_t k = 0; k < leds.size(); ++k) {
             const cv::Point2f& p = leds[k].center;
             cv::circle(both, p, 5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
@@ -393,7 +455,6 @@ int main(int argc, char** argv) {
                        5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
         }
 
-        // 轮心 + 半径圆 + 5 条槽位射线
         for (int half = 0; half < 2; ++half) {
             cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
             cv::Point2f wc = wheel + off;
@@ -408,7 +469,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 每块靶
         for (size_t k = 0; k < plates.size(); ++k) {
             bool is_armed = (static_cast<int>(k) == armed);
             cv::Scalar col = is_armed ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 160, 0);
@@ -424,20 +484,27 @@ int main(int argc, char** argv) {
             }
         }
 
-        char text[192];
+        char text[224];
         if (armed >= 0) {
             std::snprintf(text, sizeof(text),
-                          "frame %d  leds %d  plates %d  ARMED %.1f deg",
+                          "frame %d  leds %d  plates %d  ARMED %.1f  theta %.1f",
                           idx, static_cast<int>(leds.size()),
-                          static_cast<int>(plates.size()), plates[armed].angle_deg);
+                          static_cast<int>(plates.size()),
+                          plates[armed].angle_deg, tracker.thetaDeg());
         } else {
             std::snprintf(text, sizeof(text),
-                          "frame %d  leds %d  plates %d  no unique armed plate",
+                          "frame %d  leds %d  plates %d  no unique armed  theta %.1f",
                           idx, static_cast<int>(leds.size()),
-                          static_cast<int>(plates.size()));
+                          static_cast<int>(plates.size()), tracker.thetaDeg());
         }
         cv::putText(both, text, cv::Point(15, 35), cv::FONT_HERSHEY_SIMPLEX,
-                    0.75, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+                    0.72, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+        // 单独一行显示连续相位（一直累加，不是折叠值）
+        char th[96];
+        std::snprintf(th, sizeof(th), "theta %+9.2f deg", tracker.thetaDeg());
+        cv::putText(both, th, cv::Point(15, 70), cv::FONT_HERSHEY_SIMPLEX,
+                    0.7, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
         cv::imshow("frame | red mask", both);
         ++idx;
