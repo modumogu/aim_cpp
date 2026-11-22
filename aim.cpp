@@ -137,6 +137,16 @@ constexpr double kRoiScale = 1.6;
 constexpr double kMaxPredAge = 0.25;      // 数据超过这个年龄就不预测了
 constexpr double kHistoryResetAge = 1.0;  // 超过这个年龄清空历史
 
+// ---- 模型门限 --------------------------------------------------------------
+// theta 是累加的：某帧误检让相位偏了 10 度（不到 PhaseTracker 的 28.8 度拒绝线），
+// theta 就永久偏 10 度，之后所有预测都偏 10 度 —— 在 1950mm 处是 340mm，必脱靶。
+// 而且拟合发现不了：10 度的阶跃会被 c0 吸收，残差照样 0.02 度。
+//
+// 办法：用上一帧的模型外推本帧的 theta，对不上就不采用这帧。
+// 模型只外推 1 帧（16.7ms），外推误差约 0.5*w^2*A*dt^2 = 0.03 度，
+// 所以 1.5 度的门限有 50 倍余量，同时能挡住 5 度以上的误检。
+constexpr double kModelGateRad = 1.5 * CV_PI / 180.0;
+
 // ---- 形状/颜色一致性过滤 ---------------------------------------------------
 // 灯条是矩形（官方几何 41x20mm，长宽比 2.05）。
 // 实测（带光晕）填充度 0.873~0.915；1px 抗锯齿的理论下限约 0.87。
@@ -435,6 +445,16 @@ class PhaseTracker {
 public:
     explicit PhaseTracker(int slot_count) : half_slot_(CV_PI / slot_count) {}
 
+    // 算出"如果采用这帧，theta 会变成多少"，但不提交。
+    // 给模型门限做判断用：先看看结果合不合理，再决定要不要写进去。
+    double peek(bool has_raw, double raw) const {
+        if (!has_raw) return theta_;
+        if (!has_theta_) return raw;
+        double d = 0.0;
+        if (!foldDelta(raw, d)) return theta_;   // 跳变，本来就不会采用
+        return theta_ + d;
+    }
+
     double update(bool has_raw, double raw) {
         if (!has_raw) return theta_;
         if (!has_theta_) {
@@ -443,16 +463,10 @@ public:
             has_theta_ = true;
             return theta_;
         }
-
-        const double two = 2.0 * half_slot_;
-        double d = std::fmod(raw - last_raw_ + half_slot_, two);
-        if (d < 0.0) d += two;
-        d -= half_slot_;
-
-        if (std::fabs(d) > 0.8 * half_slot_) {
+        double d = 0.0;
+        if (!foldDelta(raw, d)) {
             return theta_;      // 跳变拒绝，防 72° 滑移
         }
-
         theta_ += d;
         last_raw_ = raw;
         return theta_;
@@ -463,6 +477,15 @@ public:
     double thetaDeg() const { return theta_ * 180.0 / CV_PI; }
 
 private:
+    // 把两帧原始相位之差折叠到 ±半个槽。返回 false 表示跳变太大，应当丢弃。
+    bool foldDelta(double raw, double& d) const {
+        const double two = 2.0 * half_slot_;
+        d = std::fmod(raw - last_raw_ + half_slot_, two);
+        if (d < 0.0) d += two;
+        d -= half_slot_;
+        return std::fabs(d) <= 0.8 * half_slot_;
+    }
+
     double half_slot_;
     double theta_ = 0.0;
     double last_raw_ = 0.0;
@@ -648,6 +671,7 @@ int main(int argc, char** argv) {
     double gain = 0.0;              // 固定增益，避免自动增益放大噪声
     double roi_scale = kRoiScale;   // ROI 半径 = roi_scale × R_px，0 = 关闭
     double ab_tol = kAbTol;         // a+b 约束容差（弧度），现场可放宽/收紧
+    double model_gate = kModelGateRad;   // 模型门限（弧度），--gate 以度为单位
     std::string color = "red";      // red / blue / yellow
     std::string video_path, save_path, log_path;
 
@@ -684,6 +708,8 @@ int main(int argc, char** argv) {
             roi_scale = std::stod(argv[++i]);
         } else if (a == "--abtol" && i + 1 < argc) {
             ab_tol = std::stod(argv[++i]);
+        } else if (a == "--gate" && i + 1 < argc) {
+            model_gate = std::stod(argv[++i]) * CV_PI / 180.0;   // 输入是度
         }
     }
 
@@ -728,6 +754,10 @@ int main(int argc, char** argv) {
     std::vector<std::pair<double, double>> history;   // (t, theta)
     double last_valid_t = -1.0;   // 最后一次成功测到相位的时刻
     double data_age = 1e9;        // 当前数据有多旧（秒）
+    MotionModel last_model;       // 上一帧的模型，给模型门限用
+    double last_model_t = 0.0;
+    bool has_last_model = false;
+    int gate_rejects = 0;         // 被模型门限拒掉的帧数
 
     double fps = cap.get(cv::CAP_PROP_FPS);
     if (fps <= 1.0) fps = 30.0;
@@ -810,12 +840,30 @@ int main(int argc, char** argv) {
         // ---- ④ 相位解缠 ----
         double raw_phase = 0.0;
         bool has_phase = estimatePhase(plates, &raw_phase);
-        double theta = tracker.update(has_phase, raw_phase);
 
         // 时间戳：视频按帧号/帧率，相机用真实时钟
         const double t_now = use_camera
                                  ? (cv::getTickCount() / cv::getTickFrequency() - t_start)
                                  : (idx / fps);
+
+        // ---- 模型门限 ----
+        // 用上一帧的模型外推本帧的 theta，对不上就作废这帧的相位，
+        // 防止单帧误检把累加的 theta 永久带偏（PhaseTracker 只拦 >28.8 度的大跳）
+        if (has_phase && has_last_model && last_valid_t >= 0.0 &&
+            (t_now - last_valid_t) <= kMaxPredAge) {
+            const double dt = t_now - last_model_t;
+            const double th_pred =
+                last_model.c[0] + last_model.c[1] * dt +
+                last_model.c[2] * std::cos(last_model.omega * dt) +
+                last_model.c[3] * std::sin(last_model.omega * dt);
+            const double candidate = tracker.peek(has_phase, raw_phase);
+            if (std::fabs(candidate - th_pred) > model_gate) {
+                has_phase = false;      // 这帧不可信，本帧不更新 theta
+                ++gate_rejects;
+            }
+        }
+
+        double theta = tracker.update(has_phase, raw_phase);
 
         if (has_phase && tracker.has()) {
             history.emplace_back(t_now, theta);
@@ -828,6 +876,7 @@ int main(int argc, char** argv) {
         // 丢帧太久，历史已经不可信（转盘可能换了模式/被复位），清空重新积累
         if (data_age > kHistoryResetAge) {
             history.clear();
+            has_last_model = false;     // 模型也一起作废
         }
         // 顺便剪掉过老的样本，防止内存无限增长
         while (!history.empty() && history.front().first < t_now - 3.0 * kFitWindowS) {
@@ -837,6 +886,11 @@ int main(int argc, char** argv) {
         // ---- ⑤ 拟合（用当前时刻做时间原点，不用最后一个样本的时间）----
         MotionModel model;
         bool has_model = fitMotion(history, t_now, ab_tol, &model);
+        if (has_model) {
+            last_model = model;
+            last_model_t = t_now;
+            has_last_model = true;
+        }
 
         // ---- ⑥ 预测 ----
         // 数据过期就不预测了：模型是按几百毫秒前拟合的，外推出去是瞎猜
@@ -881,7 +935,7 @@ int main(int argc, char** argv) {
             } else {
                 std::printf("  age=%.0fms  HOLD", data_age * 1000.0);
             }
-            std::printf("\n");
+            std::printf("  gate拒 %d\n", gate_rejects);
         }
 
         cv::Mat mask_bgr;
