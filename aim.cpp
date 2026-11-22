@@ -359,12 +359,15 @@ void printParams(const Params& P) {
 // 三种颜色各自的 HSV 区间。
 //   红色：H 跨 0 和 179 两端，必须两段
 //   蓝色：H≈120 一段就行
+//     但官方仿真蓝方 emissive 是 (0, 0.15, 0.6)，换算成 sRGB 约 (0,108,203)，
+//     对应 H≈103.5 —— 距离原来的下界 100 只有 3.5，太危险。
+//     不同 gamma / 色调映射会让这个值上下浮动十几，所以放宽到 [92,138]。
 //   黄色：H≈30 一段；实测黄色 LED 饱和度偏低（S≈73），所以 S 下限放到 50
 // 比赛分边是随机的，红蓝都要能用，所以必须可切换而不是写死。
 std::vector<HsvRange> rangesForColor(const std::string& color) {
     std::vector<HsvRange> v;
     if (color == "blue") {
-        v.push_back({cv::Scalar(100, 120, 120), cv::Scalar(130, 255, 255)});
+        v.push_back({cv::Scalar(92, 110, 110), cv::Scalar(138, 255, 255)});
     } else if (color == "yellow") {
         v.push_back({cv::Scalar(15, 50, 150), cv::Scalar(45, 255, 255)});
     } else {   // red（默认）
@@ -1313,6 +1316,31 @@ int main(int argc, char** argv) {
                  << lead_total << '\n';
         }
 
+        // 掩膜的主色相（诊断用）。换相机/换环境时先看这个数对不对：
+        //   红方应接近 0 或 179，蓝方应接近 103~112，黄色应接近 30。
+        // 对不上说明 HSV 区间没覆盖住，灯条会整条检不出来（而拒绝计数器全是 0）。
+        double mask_hue = -1.0;
+        if (idx % 30 == 0 && mask_px > 0 && !hch.empty()) {
+            double sx = 0.0, sy = 0.0;
+            int cnt = 0;
+            for (int y = 0; y < mask.rows; ++y) {
+                const uchar* mrow = mask.ptr<uchar>(y);
+                const uchar* hrow = hch.ptr<uchar>(y);
+                for (int x = 0; x < mask.cols; ++x) {
+                    if (!mrow[x]) continue;
+                    const double a = hrow[x] * 2.0 * CV_PI / 180.0;
+                    sx += std::cos(a);
+                    sy += std::sin(a);
+                    ++cnt;
+                }
+            }
+            if (cnt > 0) {
+                double d = std::atan2(sy, sx) * 180.0 / CV_PI;
+                if (d < 0.0) d += 360.0;
+                mask_hue = d / 2.0;   // 换回 OpenCV 的 0~179 刻度
+            }
+        }
+
         if (idx % 30 == 0) {
             std::printf("frame %d  轮廓 %d → 面积 %d 长宽比 %d 填充度 %d 色相 %d 半径 %d"
                         " → 灯条 %d  靶 %d",
@@ -1331,7 +1359,7 @@ int main(int argc, char** argv) {
             } else {
                 std::printf("  age=%.0fms  HOLD", data_age * 1000.0);
             }
-            std::printf("  gate拒 %d\n", gate_rejects);
+            std::printf("  gate拒 %d  maskH %.0f\n", gate_rejects, mask_hue);
         }
 
         cv::Mat mask_bgr;
