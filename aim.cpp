@@ -55,6 +55,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <fstream>
 
 #ifdef _WIN32
 #define NOMINMAX          // 否则 windows.h 的 min/max 宏会打散 std::min/std::max
@@ -69,10 +70,19 @@ constexpr int kWantH = 1024;
 constexpr double kDefExposure = -8; // DirectShow 的 log2 刻度，-8 ≈ 3.9ms
 constexpr double kDefWbTemp = 4600; // 手动色温，必须关自动白平衡
 
-// ---- 灯条形状的物理范围（1280x1024、2 米距离下的经验值）---------------------
-constexpr double kMinLedArea = 20.0;    // 小于这个：噪点
+// ---- 灯条形状的物理范围 ----------------------------------------------------
+// 依据官方仿真 energy_rune/model.sdf：
+//   <geometry><box><size>0.0410 0.0100 0.0200</size></box></geometry>
+//   可见面 41mm x 20mm，厚 10mm，质心距盘心 47.5mm
+// 在 1950mm、fx=1700 下约 36 x 17 px；光晕会把它撑成 ~45 x 25 px。
+//
+// 实测（官方几何、带光晕）：
+//   面积   1006 ~ 1071 px²
+//   填充度 0.873 ~ 0.915
+//   长宽比 1.73 ~ 1.80      <- 注意：不是理论上的 2.05，光晕把宽度撑大了
+constexpr double kMinLedArea = 20.0;    // 远距离小目标也要能过
 constexpr double kMaxLedArea = 2500.0;  // 大于这个：光斑 / 整片红色
-constexpr double kMinAspect = 1.3;      // 长宽比，滤掉圆形的反光点
+constexpr double kMinAspect = 1.2;      // 实测 1.73，光晕更重时会掉到 1.5，留足余量
 
 // ---- 转盘几何 --------------------------------------------------------------
 constexpr int kSlotCount = 5;                     // 5 个靶位，间隔 72°
@@ -96,6 +106,46 @@ constexpr double kOmegaMax = 2.000;
 constexpr double kOmegaStep = 0.004;
 constexpr double kMaxFitRms = 0.05;    // 弧度，约 3°；超过就 HOLD
 constexpr double kLeadS = 0.10;        // 预测提前量：100ms
+
+// ---- 手册给的运动学约束 ----------------------------------------------------
+//   spd(t) = a·sin(ωt) + b,   b = 2.090 − a
+//   积分到角度后： b = c1（一次项系数）， a = ω·√(c2²+c3²)（振幅）
+//   所以理论上 a + b 恒等于 2.090。用它做一个免费的物理合理性检查。
+//   实测（881 帧干净数据）：|a+b−2.090| 最大 0.0032 rad，取 0.05 有 15 倍余量。
+// 实测（红蓝各 881 帧、真实 C++ 管线）：|a+b−2.090| 的 P99 = 0.104，最大 0.144。
+// 这个散布不是代码错，是"过零点附近条件数爆炸"：
+//   转盘在折返点速度接近 0，1.5s 窗口只覆盖一小段弧，
+//   偏置 c0 和斜率 c1 高度相关，a、b 各自估不准（残差仍只有 0.02°）。
+// 所以门限按噪声定，不能按"理论应该严格相等"定。
+// 0.20 rad 在本数据集上误杀率 0%，同时还能挡住"拟合到完全不同的运动"。
+constexpr double kAbSum = 2.090;
+constexpr double kAbTol = 0.20;        // 弧度，--abtol 可现场调整
+// 只有"确实在正弦摆动"时才检查。小机关(a=0,b=1.047) 和固定靶(a=b=0)
+// 的 a+b 远小于 2.090，无条件检查会把它们全部误杀。
+constexpr double kMinOscAmp = 0.05;    // 振幅低于这个就当是匀速，不检查约束
+
+// ---- ROI -------------------------------------------------------------------
+// 只在转盘附近找灯条。顶灯、墙面反光都在画面边缘，这一步直接排掉。
+// 1.6 倍半径 = 488 像素（R=305 时），转盘直径 610，留了足够余量。
+constexpr double kRoiScale = 1.6;
+
+// ---- 丢帧处理 --------------------------------------------------------------
+//   0 ~ 50ms   （1~3 帧）  正常：θ 不更新，模型继续用，预测照常输出
+//   50 ~ 250ms （4~15 帧） 降级：不再输出新预测（HOLD），但保留 history
+//   > 250ms                 HOLD，停止预测
+//   > 1000ms                清空 history，等重新积累（转盘可能已经换了模式）
+constexpr double kMaxPredAge = 0.25;      // 数据超过这个年龄就不预测了
+constexpr double kHistoryResetAge = 1.0;  // 超过这个年龄清空历史
+
+// ---- 形状/颜色一致性过滤 ---------------------------------------------------
+// 灯条是矩形（官方几何 41x20mm，长宽比 2.05）。
+// 实测（带光晕）填充度 0.873~0.915；1px 抗锯齿的理论下限约 0.87。
+// 眩光、反光点、彩色边缘形状不规则，填充度通常 < 0.6。
+// 取 0.70：比实测最小 0.873 留 0.17 余量，同时和眩光分得开。
+constexpr double kMinExtent = 0.70;
+// 真实 LED 单一色相，H 的环形标准差只有 1~3°；
+// 白色高光周围的色差边缘（紫边/红边）H 分布很散。
+constexpr double kMaxHueStdDeg = 6.0;
 
 // ---- 颜色阈值 --------------------------------------------------------------
 // 红色在 HSV 的 H 上跨 0 和 179 两端，所以要两段。
@@ -124,8 +174,11 @@ std::vector<HsvRange> rangesForColor(const std::string& color) {
 
 // ============================================================================
 //  ① 颜色掩膜
+//     ROI 圆：只保留转盘周围的像素，顶灯/墙面反光在圆外，一步排掉。
+//     同时把 H 通道回传出去，后面算色相一致性要用。
 // ============================================================================
-cv::Mat buildMask(const cv::Mat& bgr, const std::vector<HsvRange>& ranges) {
+cv::Mat buildMask(const cv::Mat& bgr, const std::vector<HsvRange>& ranges,
+                  cv::Point2f wheel, double roi_radius, cv::Mat* h_out) {
     cv::Mat hsv;
     cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
 
@@ -136,6 +189,17 @@ cv::Mat buildMask(const cv::Mat& bgr, const std::vector<HsvRange>& ranges) {
         cv::bitwise_or(mask, m, mask);
     }
 
+    if (h_out) {
+        cv::extractChannel(hsv, *h_out, 0);   // H 通道，色相一致性检查要用
+    }
+
+    // 圆形 ROI：转盘之外的红色一律不要（顶灯、衣服、横幅、广告牌）
+    if (roi_radius > 1.0) {
+        cv::Mat roi = cv::Mat::zeros(mask.size(), CV_8UC1);
+        cv::circle(roi, wheel, static_cast<int>(roi_radius), cv::Scalar(255), -1);
+        cv::bitwise_and(mask, roi, mask);
+    }
+
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
     return mask;
@@ -143,6 +207,7 @@ cv::Mat buildMask(const cv::Mat& bgr, const std::vector<HsvRange>& ranges) {
 
 // ============================================================================
 //  ② 灯条
+//     三级过滤，并且统计每一级拒了多少个——现场调参就靠这三个数。
 // ============================================================================
 struct Led {
     cv::Point2f center;
@@ -150,31 +215,118 @@ struct Led {
     double aspect = 0.0;
 };
 
-std::vector<Led> detectLeds(const cv::Mat& mask, int* raw_count) {
+struct RejectStats {
+    int raw = 0;          // 轮廓总数
+    int by_area = 0;      // 面积不合格
+    int by_aspect = 0;    // 长宽比不合格（圆斑/光晕）
+    int by_extent = 0;    // 填充度不合格（形状不规则，眩光的典型特征）
+    int by_hue = 0;       // 色相不一致（彩色边缘/色差）
+    int by_radius = 0;    // 半径不对（不在转盘上）
+    int kept = 0;
+};
+
+// 色相的环形标准差（度）。
+// H 在 0/179 处回绕，直接算标准差会把"红色跨两端"算成巨大方差，
+// 所以先把 H 映射到复平面求合成向量长度 R，再换算：sd = sqrt(-2 ln R)。
+//   真实 LED：同一色相，R 接近 1，sd 只有 1~3°
+//   彩色边缘/眩光：色相分散，R 小，sd 会超过 10°
+double hueCircularStdDeg(const cv::Mat& hch, const std::vector<cv::Point>& c) {
+    cv::Rect bb = cv::boundingRect(c);
+    if (bb.width < 2 || bb.height < 2) return 0.0;
+
+    cv::Mat local = cv::Mat::zeros(bb.size(), CV_8UC1);
+    std::vector<cv::Point> shifted;
+    shifted.reserve(c.size());
+    for (const auto& p : c) shifted.emplace_back(p.x - bb.x, p.y - bb.y);
+    std::vector<std::vector<cv::Point>> polys{shifted};
+    cv::fillPoly(local, polys, cv::Scalar(255));
+
+    cv::Mat hroi = hch(bb);
+    double sc = 0.0, ss = 0.0;
+    int n = 0;
+    for (int y = 0; y < local.rows; ++y) {
+        const uchar* lm = local.ptr<uchar>(y);
+        const uchar* hp = hroi.ptr<uchar>(y);
+        for (int x = 0; x < local.cols; ++x) {
+            if (!lm[x]) continue;
+            const double a = hp[x] * (CV_PI / 90.0);   // H/180*2π
+            sc += std::cos(a);
+            ss += std::sin(a);
+            ++n;
+        }
+    }
+    if (n < 10) return 0.0;
+    const double R = std::hypot(sc, ss) / n;
+    if (R < 1e-9) return 180.0;
+    return std::sqrt(-2.0 * std::log(R)) * 180.0 / CV_PI;
+}
+
+std::vector<Led> detectLeds(const cv::Mat& mask, const cv::Mat& hch, cv::Point2f wheel,
+                            double R_px, double radius_tol, RejectStats* st) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    if (raw_count) *raw_count = static_cast<int>(contours.size());
+    if (st) st->raw = static_cast<int>(contours.size());
 
     std::vector<Led> leds;
     for (const auto& c : contours) {
         double area = cv::contourArea(c);
-        if (area < kMinLedArea || area > kMaxLedArea) continue;
+        if (area < kMinLedArea || area > kMaxLedArea) {
+            if (st) ++st->by_area;
+            continue;
+        }
 
         cv::RotatedRect rr = cv::minAreaRect(c);
         double w = rr.size.width, h = rr.size.height;
         double lo = std::min(w, h), hi = std::max(w, h);
-        if (lo <= 0.0) continue;
+        if (lo <= 0.0) {
+            if (st) ++st->by_aspect;
+            continue;
+        }
         double aspect = hi / lo;
-        if (aspect < kMinAspect) continue;
+        if (aspect < kMinAspect) {
+            if (st) ++st->by_aspect;
+            continue;
+        }
+
+        // 填充度 = 轮廓面积 / 最小外接矩形面积。
+        // 圆角矩形实测 0.837~0.931；眩光、反光点形状不规则，明显更低。
+        const double extent = area / (w * h);
+        if (extent < kMinExtent) {
+            if (st) ++st->by_extent;
+            continue;
+        }
+
+        // 色相一致性：真实 LED 是单色，H 的环形标准差很小
+        if (!hch.empty()) {
+            const double sd = hueCircularStdDeg(hch, c);
+            if (sd > kMaxHueStdDeg) {
+                if (st) ++st->by_hue;
+                continue;
+            }
+        }
 
         cv::Moments M = cv::moments(c);
-        if (M.m00 <= 0.0) continue;
+        if (M.m00 <= 0.0) {
+            if (st) ++st->by_area;
+            continue;
+        }
 
         Led led;
         led.center = cv::Point2f(static_cast<float>(M.m10 / M.m00),
                                  static_cast<float>(M.m01 / M.m00));
         led.area = area;
         led.aspect = aspect;
+
+        // 半径检查放在这里（而不是等到槽位归组）：
+        // 离轮心太远的红色块一定不是灯条，早点扔掉还能少一次聚簇运算。
+        cv::Point2f d = led.center - wheel;
+        double r = std::hypot(d.x, d.y);
+        if (std::fabs(r - R_px) > radius_tol * R_px) {
+            if (st) ++st->by_radius;
+            continue;
+        }
+
+        if (st) ++st->kept;
         leds.push_back(led);
     }
     return leds;
@@ -324,6 +476,8 @@ struct MotionModel {
     double omega = 0.0;
     double c[4] = {0.0, 0.0, 0.0, 0.0};
     double rms = 0.0;
+    double a = 0.0;      // 摆动振幅（rad/s），= ω·√(c2²+c3²)
+    double b = 0.0;      // 平均角速度（rad/s），= c1
 };
 
 // 4x4 线性方程组，高斯消元（部分主元）
@@ -352,13 +506,16 @@ bool solve4(double A[4][4], const double b[4], double x[4]) {
     return true;
 }
 
-bool fitMotion(const std::vector<std::pair<double, double>>& history, MotionModel* out) {
+// t_now 必须由调用方传"当前时刻"，不能用 history.back().first。
+// 否则丢帧时拟合还以为现在停在最后一次成功的那一帧，
+// 会拿过期的模型外推，预测出来的角度对应的是几百毫秒前。
+bool fitMotion(const std::vector<std::pair<double, double>>& history, double t_now,
+               double ab_tol, MotionModel* out) {
     if (static_cast<int>(history.size()) < kMinFitSamples) return false;
 
-    const double t_now = history.back().first;
     std::vector<double> ts, ys;
     for (const auto& p : history) {
-        if (p.first >= t_now - kFitWindowS) {
+        if (p.first >= t_now - kFitWindowS && p.first <= t_now) {
             ts.push_back(p.first - t_now);   // 以"现在"为原点，数值更稳
             ys.push_back(p.second);
         }
@@ -398,11 +555,26 @@ bool fitMotion(const std::vector<std::pair<double, double>>& history, MotionMode
         }
     }
 
-    if (best_rms > kMaxFitRms) return false;   // 不可信 -> HOLD
+    if (best_rms > kMaxFitRms) return false;   // 残差大 -> 不可信，HOLD
 
     out->omega = best_w;
     out->rms = best_rms;
     for (int k = 0; k < 4; ++k) out->c[k] = best_c[k];
+
+    // 从拟合系数反推出物理量：
+    //   θ(t) = c0 + c1·t + c2·cos(ωt) + c3·sin(ωt)
+    //   求导 => spd(t) = c1 + ω·(−c2·sin + c3·cos)
+    //   所以 b = c1，振幅 a = ω·√(c2²+c3²)
+    out->b = best_c[1];
+    out->a = best_w * std::hypot(best_c[2], best_c[3]);
+
+    // 手册约束：b = 2.090 − a，即 a + b 恒等于 2.090。
+    // 只在确实存在正弦摆动时检查——小机关(a=0,b≈1.047)、固定靶(a=b=0)
+    // 的 a+b 远不是 2.090，无条件检查会全部误杀。
+    if (out->a > kMinOscAmp &&
+        std::fabs(out->a + out->b - kAbSum) > ab_tol) {
+        return false;   // 物理上不成立，说明拟合到了错误的对象
+    }
     return true;
 }
 
@@ -421,7 +593,8 @@ double predictTarget(const MotionModel& m, double theta_now, double angle_now,
 // ============================================================================
 //  打开相机
 // ============================================================================
-int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double wb_temp) {
+int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double wb_temp,
+               double gain) {
     for (int idx = 0; idx < 5; ++idx) {
         if (force_index >= 0 && idx != force_index) continue;
 
@@ -438,6 +611,9 @@ int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double w
         cap.set(cv::CAP_PROP_EXPOSURE, exposure);
         cap.set(cv::CAP_PROP_AUTO_WB, 0);
         cap.set(cv::CAP_PROP_WB_TEMPERATURE, wb_temp);
+        // 增益必须钉死。自动增益在暗处会把噪声放大，
+        // 直接表现为 mask 里冒出一堆小碎块，面积过滤都救不回来。
+        cap.set(cv::CAP_PROP_GAIN, gain);
 
         cv::Mat probe;
         cap >> probe;
@@ -469,8 +645,11 @@ int main(int argc, char** argv) {
     double wheel_x = -1.0;
     double wheel_y = -1.0;
     double R_px = kDefWheelRpx;
+    double gain = 0.0;              // 固定增益，避免自动增益放大噪声
+    double roi_scale = kRoiScale;   // ROI 半径 = roi_scale × R_px，0 = 关闭
+    double ab_tol = kAbTol;         // a+b 约束容差（弧度），现场可放宽/收紧
     std::string color = "red";      // red / blue / yellow
-    std::string video_path, save_path;
+    std::string video_path, save_path, log_path;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -497,12 +676,20 @@ int main(int argc, char** argv) {
             show_raw = true;        // 启动时就是纯相机画面
         } else if (a == "--color" && i + 1 < argc) {
             color = argv[++i];
+        } else if (a == "--log" && i + 1 < argc) {
+            log_path = argv[++i];
+        } else if (a == "--gain" && i + 1 < argc) {
+            gain = std::stod(argv[++i]);
+        } else if (a == "--roi" && i + 1 < argc) {
+            roi_scale = std::stod(argv[++i]);
+        } else if (a == "--abtol" && i + 1 < argc) {
+            ab_tol = std::stod(argv[++i]);
         }
     }
 
     cv::VideoCapture cap;
     if (use_camera) {
-        int idx = openCamera(cap, want_index, exposure, wb_temp);
+        int idx = openCamera(cap, want_index, exposure, wb_temp, gain);
         if (idx < 0) {
             std::cerr << "没找到能跑 1280x1024 的相机。\n"
                          "检查：1) USB 线插紧  2) 拔掉无线键鼠接收器（会抢带宽）"
@@ -539,6 +726,8 @@ int main(int argc, char** argv) {
     bool wheel_set = false;
     PhaseTracker tracker(kSlotCount);
     std::vector<std::pair<double, double>> history;   // (t, theta)
+    double last_valid_t = -1.0;   // 最后一次成功测到相位的时刻
+    double data_age = 1e9;        // 当前数据有多旧（秒）
 
     double fps = cap.get(cv::CAP_PROP_FPS);
     if (fps <= 1.0) fps = 30.0;
@@ -550,6 +739,15 @@ int main(int argc, char** argv) {
     double fps_t0 = cv::getTickCount() / cv::getTickFrequency();
     bool raw_window_open = false;
     const std::string win_name = "aim | " + color + " | frame+mask";
+
+    // 逐帧日志：调试和技术文档的数据来源
+    std::ofstream logf;
+    if (!log_path.empty()) {
+        logf.open(log_path);
+        logf << "frame,t,theta_deg,w,rms_deg,pred_deg,armed_angle,plates,leds,"
+                "mask_px,a,b,data_age\n";
+        std::cout << "日志写入 " << log_path << "\n";
+    }
 
     while (true) {
         cv::Mat frame;
@@ -575,8 +773,11 @@ int main(int argc, char** argv) {
                                     static_cast<float>(wheel_y));
             }
             wheel_set = true;
+            const double roi_r = roi_scale * R_px;
             std::cout << "轮心 (" << wheel.x << ", " << wheel.y
-                      << ")   半径 " << R_px << " px\n";
+                      << ")   半径 " << R_px << " px"
+                      << "   ROI " << (roi_r > 1.0 ? std::to_string((int)roi_r) + " px" : "关闭")
+                      << "\n";
         }
 
         if (!warned_dark && cv::mean(frame)[0] < 5.0) {
@@ -586,9 +787,11 @@ int main(int argc, char** argv) {
             warned_dark = true;
         }
 
-        cv::Mat mask = buildMask(frame, ranges);
-        int raw_contours = 0;
-        std::vector<Led> leds = detectLeds(mask, &raw_contours);
+        RejectStats st;
+        cv::Mat hch;
+        cv::Mat mask = buildMask(frame, ranges, wheel, roi_scale * R_px, &hch);
+        const int mask_px = cv::countNonZero(mask);   // 记进日志，用来查灯光闪烁
+        std::vector<Led> leds = detectLeds(mask, hch, wheel, R_px, kRadiusTol, &st);
         std::vector<Plate> plates = assignSlots(leds, wheel, R_px);
 
         // 待激活靶必须唯一
@@ -616,36 +819,68 @@ int main(int argc, char** argv) {
 
         if (has_phase && tracker.has()) {
             history.emplace_back(t_now, theta);
-            while (!history.empty() && history.front().first < t_now - 3.0 * kFitWindowS) {
-                history.erase(history.begin());
-            }
+            last_valid_t = t_now;
+            data_age = 0.0;
+        } else {
+            // 丢帧：数据年龄随时间增长
+            data_age = (last_valid_t < 0.0) ? 1e9 : (t_now - last_valid_t);
+        }
+        // 丢帧太久，历史已经不可信（转盘可能换了模式/被复位），清空重新积累
+        if (data_age > kHistoryResetAge) {
+            history.clear();
+        }
+        // 顺便剪掉过老的样本，防止内存无限增长
+        while (!history.empty() && history.front().first < t_now - 3.0 * kFitWindowS) {
+            history.erase(history.begin());
         }
 
-        // ---- ⑤ 拟合 ----
+        // ---- ⑤ 拟合（用当前时刻做时间原点，不用最后一个样本的时间）----
         MotionModel model;
-        bool has_model = fitMotion(history, &model);
+        bool has_model = fitMotion(history, t_now, ab_tol, &model);
 
         // ---- ⑥ 预测 ----
+        // 数据过期就不预测了：模型是按几百毫秒前拟合的，外推出去是瞎猜
+        bool fresh = (data_age <= kMaxPredAge);
         bool ready = false;
         double pred = 0.0;
-        if (has_model && tracker.has() && armed >= 0) {
+        if (has_model && fresh && tracker.has() && armed >= 0) {
             pred = predictTarget(model, theta,
                                  plates[armed].angle_deg * CV_PI / 180.0,
                                  kLeadS) * 180.0 / CV_PI;
             ready = true;
         }
 
+        // ---- 逐帧日志 ----
+        if (logf.is_open()) {
+            logf << idx << ',' << t_now << ','
+                 << (tracker.has() ? tracker.thetaDeg() : 0.0) << ','
+                 << (has_model ? model.omega : 0.0) << ','
+                 << (has_model ? model.rms * 180.0 / CV_PI : 0.0) << ','
+                 << (ready ? pred : 0.0) << ','
+                 << (armed >= 0 ? plates[armed].angle_deg : 0.0) << ','
+                 << plates.size() << ',' << leds.size() << ',' << mask_px << ','
+                 << (has_model ? model.a : 0.0) << ','
+                 << (has_model ? model.b : 0.0) << ',' << data_age << '\n';
+        }
+
         if (idx % 30 == 0) {
-            std::printf("frame %d  灯条 %d  靶 %d", idx,
-                        static_cast<int>(leds.size()), static_cast<int>(plates.size()));
+            std::printf("frame %d  轮廓 %d → 面积 %d 长宽比 %d 填充度 %d 色相 %d 半径 %d"
+                        " → 灯条 %d  靶 %d",
+                        idx, st.raw, st.by_area, st.by_aspect, st.by_extent, st.by_hue,
+                        st.by_radius, static_cast<int>(leds.size()),
+                        static_cast<int>(plates.size()));
             if (tracker.has()) std::printf("  theta %.1f", tracker.thetaDeg());
-            if (has_model)
-                std::printf("  w=%.3f  rms=%.2f", model.omega,
-                            model.rms * 180.0 / CV_PI);
-            if (ready)
-                std::printf("  pred %.1f  READY", pred);
-            else
-                std::printf("  HOLD");
+            if (has_model) {
+                std::printf("  w=%.3f a=%.3f b=%.3f rms=%.2f", model.omega, model.a,
+                            model.b, model.rms * 180.0 / CV_PI);
+            }
+            if (data_age > kMaxPredAge) {
+                std::printf("  age=%.0fms  HOLD", data_age * 1000.0);
+            } else if (ready) {
+                std::printf("  age=%.0fms  pred %.1f  READY", data_age * 1000.0, pred);
+            } else {
+                std::printf("  age=%.0fms  HOLD", data_age * 1000.0);
+            }
             std::printf("\n");
         }
 
