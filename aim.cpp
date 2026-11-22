@@ -229,6 +229,15 @@ struct Params {
     double pipeline_delay = 0.10;    // 视觉+串口+云台响应，不含飞行时间
     double g_acc = 9.8;
     double pitch_bias_deg = 0.0;     // 实弹标定后的经验修正
+
+    // 相机安装姿态（相对云台零位）
+    //   camera_pitch_deg：相机光轴相对水平面向上抬了多少。
+    //     相机固定在基座上时通常要抬一点，才能把整个转盘收进画面。
+    //     这个值不补的话，弹道高度差会算错，pitch 也就错了。
+    //   camera_yaw_deg：相机光轴相对云台零位的水平夹角，通常为 0。
+    double camera_pitch_deg = 0.0;
+    double camera_yaw_deg = 0.0;
+    double y_scale = 1.0;            // 竖直补偿系数 = 1/cos(camera_pitch_deg)，派生量
 };
 
 std::string trimStr(const std::string& s) {
@@ -316,6 +325,8 @@ bool loadParams(const std::string& path, Params* P) {
             else if (k == "muzzle_offset_mm") P->muzzle_offset_mm = std::stod(v);
             else if (k == "pipeline_delay") P->pipeline_delay = std::stod(v);
             else if (k == "pitch_bias_deg") P->pitch_bias_deg = std::stod(v);
+            else if (k == "camera_pitch_deg") P->camera_pitch_deg = std::stod(v);
+            else if (k == "camera_yaw_deg")   P->camera_yaw_deg = std::stod(v);
             else {
                 std::cout << "[config] 未知键 \"" << k << "\"，已忽略\n";
                 continue;
@@ -401,7 +412,8 @@ cv::Mat buildMask(const cv::Mat& bgr, const std::vector<HsvRange>& ranges,
 //     三级过滤，并且统计每一级拒了多少个——现场调参就靠这三个数。
 // ============================================================================
 struct Led {
-    cv::Point2f center;
+    cv::Point2f center;   // 原始质心（画图用）
+    cv::Point2f geom;     // 做过透视压缩补偿的点（算角度和半径用）
     double area = 0.0;
     double aspect = 0.0;
 };
@@ -508,9 +520,16 @@ std::vector<Led> detectLeds(const cv::Mat& mask, const cv::Mat& hch, cv::Point2f
         led.area = area;
         led.aspect = aspect;
 
+        // 透视压缩补偿：相机仰角 t 时，竖直方向被压缩 cos(t)，
+        // 正圆看起来是竖着压扁的椭圆。把竖直偏移除以 cos(t) 还原。
+        // 不补的话，靶的角度会产生最多约 1.9° 的系统偏差（t=15° 时），
+        // 比我们 0.1° 的精度要求大 20 倍。
+        led.geom = led.center;
+        led.geom.y = wheel.y + (led.center.y - wheel.y) * P.y_scale;
+
         // 半径检查放在这里（而不是等到槽位归组）：
         // 离轮心太远的红色块一定不是灯条，早点扔掉还能少一次聚簇运算。
-        cv::Point2f d = led.center - wheel;
+        cv::Point2f d = led.geom - wheel;
         double r = std::hypot(d.x, d.y);
         if (std::fabs(r - R_px) > P.radius_tol * R_px) {
             if (st) ++st->by_radius;
@@ -541,7 +560,7 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
     };
     std::vector<Item> items;
     for (int i = 0; i < static_cast<int>(leds.size()); ++i) {
-        cv::Point2f d = leds[i].center - wheel;
+        cv::Point2f d = leds[i].geom - wheel;
         double r = std::hypot(d.x, d.y);
         if (std::fabs(r - R_px) > kRadiusTol * R_px) continue;
         double a = std::atan2(d.y, d.x) * 180.0 / CV_PI;
@@ -579,7 +598,7 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
             cv::Point2f c(0.0f, 0.0f);
             for (const auto& it : cur) {
                 p.bars.push_back(it.idx);
-                c += leds[it.idx].center;
+                c += leds[it.idx].geom;
             }
             c *= 1.0f / static_cast<float>(cur.size());
             p.center = c;
@@ -1018,6 +1037,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    // 由相机仰角推出竖直补偿系数（透视压缩的逆）
+    if (std::fabs(P.camera_pitch_deg) < 80.0) {
+        P.y_scale = 1.0 / std::cos(P.camera_pitch_deg * CV_PI / 180.0);
+    }
     printParams(P);
 
     cv::VideoCapture cap;
@@ -1228,28 +1251,35 @@ int main(int argc, char** argv) {
         PoseResult pose;
         double lead_total = P.lead_s;        // 默认只用视觉延迟
         double pitch_cmd_deg = 0.0;
+        double yaw_cmd_deg = 0.0;
         double h_rel = 0.0;
         if (armed >= 0 && plates[armed].bars.size() == 4) {
             std::vector<cv::Point2f> pts;
             pts.reserve(4);
-            for (int bi : plates[armed].bars) pts.push_back(leds[bi].center);
+            for (int bi : plates[armed].bars) pts.push_back(leds[bi].geom);   // 用补偿后的点，否则倾斜会让深度偏
 
             pose = solvePlatePose(pts, P);
             if (pose.ok) {
-                const double d_m = pose.dist_mm / 1000.0;
-                // 靶相对【枪口】的高度差：相机在枪管上方，
-                // 所以从枪口看，靶比从相机看要更高一点
-                h_rel = d_m * std::tan(pose.los_pitch_deg * CV_PI / 180.0)
-                        + P.muzzle_offset_mm / 1000.0;
+                // 把"相对相机光轴"的视线角换算到"相对云台零位（水平面）"。
+                // 相机固定在基座上时通常要抬头一点，不补这个偏移，
+                // 弹道的高度差就会算错，pitch 跟着错。
+                const double elev_deg = pose.los_pitch_deg + P.camera_pitch_deg;
+                const double yaw_deg = pose.yaw_deg + P.camera_yaw_deg;
+                const double elev = elev_deg * CV_PI / 180.0;
+
+                // 水平距离（不是直线距离）与靶相对枪口的高度差
+                const double d_h = (pose.dist_mm / 1000.0) * std::cos(elev);
+                h_rel = d_h * std::tan(elev) + P.muzzle_offset_mm / 1000.0;
 
                 double theta_rad = 0.0;
-                if (ballisticPitch(P.ball_speed, d_m, h_rel, P.g_acc, &theta_rad)) {
-                    const double t_fly = flightTime(P.ball_speed, d_m, theta_rad);
+                if (ballisticPitch(P.ball_speed, d_h, h_rel, P.g_acc, &theta_rad)) {
+                    const double t_fly = flightTime(P.ball_speed, d_h, theta_rad);
                     // 弹道抬升 + 实弹标定的经验修正
                     pitch_cmd_deg = theta_rad * 180.0 / CV_PI + P.pitch_bias_deg;
                     // 提前量要包含飞行时间，否则永远打晚
                     lead_total = P.pipeline_delay + t_fly;
                 }
+                yaw_cmd_deg = yaw_deg;
             }
         }
 
@@ -1402,7 +1432,7 @@ int main(int argc, char** argv) {
         if (pose.ok) {
             std::snprintf(pq, sizeof(pq),
                           "d=%.0fmm  yaw=%+.2f  pitch=%.2f  lead=%.3fs  rep=%.2fpx",
-                          pose.dist_mm, pose.yaw_deg, pitch_cmd_deg, lead_total,
+                          pose.dist_mm, yaw_cmd_deg, pitch_cmd_deg, lead_total,
                           pose.reproj_px);
         } else {
             std::snprintf(pq, sizeof(pq), "PnP invalid (need 4 bars)");

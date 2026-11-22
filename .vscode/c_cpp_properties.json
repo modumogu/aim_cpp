@@ -7,6 +7,8 @@
         "D:/Apps/opencv/opencv/build/include"
       ],
       "defines": ["_DEBUG", "UNICODE", "_UNICODE"],
+      "compilerPath": "D:/Apps/VSstudio/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe",
+      "compilerArgs": ["/utf-8"],
       "cppStandard": "c++17",
       "cStandard": "c17",
       "intelliSenseMode": "windows-msvc-x64"
