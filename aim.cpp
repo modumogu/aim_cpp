@@ -148,6 +148,9 @@ constexpr double kHistoryResetAge = 1.0;  // 超过这个年龄清空历史
 // 所以 1.5 度的门限有 50 倍余量，同时能挡住 5 度以上的误检。
 constexpr double kModelGateRad = 1.5 * CV_PI / 180.0;
 
+// PnP 反投影误差上限（像素）。超过说明 4 个点的对应关系错了或位姿不可信。
+constexpr double kMaxPnPReproj = 3.0;
+
 // ---- 形状/颜色一致性过滤 ---------------------------------------------------
 // 灯条是矩形（官方几何 41x20mm，长宽比 2.05）。
 // 实测（带光晕）填充度 0.873~0.915；1px 抗锯齿的理论下限约 0.87。
@@ -182,6 +185,7 @@ struct Params {
     double wheel_y = -1.0;
     double px_per_mm = kPxPerMm;                 // 每毫米多少像素
     double wheel_rpx = kDefWheelRpx;             // 由 px_per_mm 推出，可单独覆盖
+    double auto_rpx = 1.0;                       // 1 = 用检出的灯条自动估计半径
     double roi_scale = kRoiScale;
 
     // 灯条形状
@@ -210,6 +214,21 @@ struct Params {
     double max_pred_age = kMaxPredAge;
     double history_reset_age = kHistoryResetAge;
     double model_gate = kModelGateRad;           // 弧度
+
+    // 相机内参（棋盘格标定结果）
+    double fx = 1700.37, fy = 1701.76;
+    double cx = 647.93, cy = 490.34;
+    double k1 = -0.1262, k2 = 0.5895, p1 = -0.0011, p2 = 0.0009, k3 = -1.0703;
+
+    // 靶的几何（官方 SDF）：4 条灯条距盘心 47.5mm，成十字
+    double bar_offset_mm = 47.5;
+
+    // 弹道
+    double ball_speed = 12.0;        // 乒乓球初速 m/s（仿真默认 12）
+    double muzzle_offset_mm = 75.0;  // 枪管轴比相机光轴低多少（相机装在枪管上方）
+    double pipeline_delay = 0.10;    // 视觉+串口+云台响应，不含飞行时间
+    double g_acc = 9.8;
+    double pitch_bias_deg = 0.0;     // 实弹标定后的经验修正
 };
 
 std::string trimStr(const std::string& s) {
@@ -262,6 +281,7 @@ bool loadParams(const std::string& path, Params* P) {
             else if (k == "px_per_mm")      { P->px_per_mm = std::stod(v);
                                               P->wheel_rpx = 350.0 * P->px_per_mm; }
             else if (k == "wheel_rpx")      P->wheel_rpx = std::stod(v);
+            else if (k == "auto_rpx")       P->auto_rpx = std::stod(v);
             else if (k == "roi_scale")      P->roi_scale = std::stod(v);
             else if (k == "min_area")       P->min_area = std::stod(v);
             else if (k == "max_area")       P->max_area = std::stod(v);
@@ -282,6 +302,20 @@ bool loadParams(const std::string& path, Params* P) {
             else if (k == "max_pred_age")   P->max_pred_age = std::stod(v);
             else if (k == "history_reset_age") P->history_reset_age = std::stod(v);
             else if (k == "model_gate")     P->model_gate = std::stod(v) * CV_PI / 180.0;
+            else if (k == "fx")             P->fx = std::stod(v);
+            else if (k == "fy")             P->fy = std::stod(v);
+            else if (k == "cx")             P->cx = std::stod(v);
+            else if (k == "cy")             P->cy = std::stod(v);
+            else if (k == "k1")             P->k1 = std::stod(v);
+            else if (k == "k2")             P->k2 = std::stod(v);
+            else if (k == "p1")             P->p1 = std::stod(v);
+            else if (k == "p2")             P->p2 = std::stod(v);
+            else if (k == "k3")             P->k3 = std::stod(v);
+            else if (k == "bar_offset_mm")  P->bar_offset_mm = std::stod(v);
+            else if (k == "ball_speed")     P->ball_speed = std::stod(v);
+            else if (k == "muzzle_offset_mm") P->muzzle_offset_mm = std::stod(v);
+            else if (k == "pipeline_delay") P->pipeline_delay = std::stod(v);
+            else if (k == "pitch_bias_deg") P->pitch_bias_deg = std::stod(v);
             else {
                 std::cout << "[config] 未知键 \"" << k << "\"，已忽略\n";
                 continue;
@@ -297,8 +331,9 @@ bool loadParams(const std::string& path, Params* P) {
 
 void printParams(const Params& P) {
     std::printf("[参数] exposure=%.2f wb=%.0f gain=%.2f\n", P.exposure, P.wb_temp, P.gain);
-    std::printf("[参数] wheel=(%.0f,%.0f) px_per_mm=%.4f R_px=%.1f roi=%.2f\n",
-                P.wheel_x, P.wheel_y, P.px_per_mm, P.wheel_rpx, P.roi_scale);
+    std::printf("[参数] wheel=(%.0f,%.0f) px_per_mm=%.4f R_px=%.1f roi=%.2f autoR=%s\n",
+                P.wheel_x, P.wheel_y, P.px_per_mm, P.wheel_rpx, P.roi_scale,
+                P.auto_rpx > 0.5 ? "on" : "off");
     std::printf("[参数] area=[%.0f,%.0f] aspect>=%.2f extent>=%.2f hue_sd<=%.1f\n",
                 P.min_area, P.max_area, P.min_aspect, P.min_extent, P.max_hue_std);
     std::printf("[参数] gap=%.1fdeg radius_tol=%.2f\n", P.group_gap_deg, P.radius_tol);
@@ -622,6 +657,11 @@ public:
     double theta() const { return theta_; }
     double thetaDeg() const { return theta_ * 180.0 / CV_PI; }
 
+    // 丢弃连续性，把下一帧当作新起点。
+    // 必须提供这个：随机固定靶会突然跳到新位置。跳变超过 28.8° 时每一帧都会被
+    // 跳变拒绝，last_raw_ 不更新，theta 就永久冻结、再也救不回来。
+    void reset() { has_theta_ = false; }
+
 private:
     // 把两帧原始相位之差折叠到 ±半个槽。返回 false 表示跳变太大，应当丢弃。
     bool foldDelta(double raw, double& d) const {
@@ -757,6 +797,117 @@ double predictTarget(const MotionModel& m, double theta_now, double angle_now,
     double theta_future = m.c[0] + m.c[1] * lead + m.c[2] * std::cos(m.omega * lead) +
                           m.c[3] * std::sin(m.omega * lead);
     return angle_now + (theta_future - theta_now);
+}
+
+// ============================================================================
+//  ⑧ 位姿解算（solvePnP）+ 弹道补偿
+//
+//  靶的 3D 模型（官方 SDF，已验证是正十字）：
+//      4 条灯条质心距盘心 47.5mm，分别在径向 ±47.5 与切向 ±47.5
+//      放在靶平面局部坐标系里就是 (±47.5, 0, 0) 和 (0, ±47.5, 0)
+//
+//  注意：这个十字在 90° 旋转和镜像下都对称，所以"哪条灯对应哪个 3D 点"
+//  的循环顺序不影响解出的中心位置 tvec —— 只要每帧顺序一致就行。
+//
+//  PnP 给出 tvec = 靶心在相机坐标系中的 (X, Y, Z)，单位 mm：
+//      X 右、Y 下、Z 前方（OpenCV 相机坐标系）
+//  Z 就是"距离"，这是弹道补偿和飞行时间唯一的数据来源。
+// ============================================================================
+struct PoseResult {
+    bool ok = false;
+    double x = 0.0, y = 0.0, z = 0.0;   // mm，相机坐标系
+    double dist_mm = 0.0;
+    double yaw_deg = 0.0;               // 水平偏角，右正
+    double los_pitch_deg = 0.0;         // 视线俯仰角，上正
+    double reproj_px = 0.0;
+};
+
+PoseResult solvePlatePose(const std::vector<cv::Point2f>& pts, const Params& P) {
+    PoseResult r;
+    if (pts.size() < 4) return r;
+
+    // 按"绕质心的极角"排序，保证每帧的循环顺序一致
+    cv::Point2f c(0.0f, 0.0f);
+    for (const auto& p : pts) c += p;
+    c *= 1.0f / static_cast<float>(pts.size());
+
+    std::vector<cv::Point2f> ordered(pts.begin(), pts.begin() + 4);
+    std::sort(ordered.begin(), ordered.end(),
+              [&](const cv::Point2f& a, const cv::Point2f& b) {
+                  return std::atan2(a.y - c.y, a.x - c.x) <
+                         std::atan2(b.y - c.y, b.x - c.x);
+              });
+
+    const double r_off = P.bar_offset_mm;
+    std::vector<cv::Point3f> obj = {
+        {static_cast<float>(r_off), 0.0f, 0.0f},
+        {0.0f, static_cast<float>(r_off), 0.0f},
+        {static_cast<float>(-r_off), 0.0f, 0.0f},
+        {0.0f, static_cast<float>(-r_off), 0.0f},
+    };
+
+    cv::Mat K = (cv::Mat_<double>(3, 3) << P.fx, 0.0, P.cx,
+                                          0.0, P.fy, P.cy,
+                                          0.0, 0.0, 1.0);
+    cv::Mat D = (cv::Mat_<double>(1, 5) << P.k1, P.k2, P.p1, P.p2, P.k3);
+
+    cv::Vec3d rvec, tvec;
+    bool solved = false;
+    try {
+        // 4 点共面，用专门为此设计的 IPPE；失败再退回通用迭代法
+        solved = cv::solvePnP(obj, ordered, K, D, rvec, tvec, false,
+                              cv::SOLVEPNP_IPPE);
+    } catch (...) {
+        solved = false;
+    }
+    if (!solved) {
+        try {
+            solved = cv::solvePnP(obj, ordered, K, D, rvec, tvec, false,
+                                  cv::SOLVEPNP_ITERATIVE);
+        } catch (...) {
+            return r;
+        }
+    }
+    if (!solved || tvec[2] <= 0.0) return r;
+
+    // 用解出来的位姿反投影，检验是否可信
+    std::vector<cv::Point2f> proj;
+    cv::projectPoints(obj, rvec, tvec, K, D, proj);
+    double sse = 0.0;
+    for (size_t i = 0; i < proj.size(); ++i) {
+        double dx = proj[i].x - ordered[i].x, dy = proj[i].y - ordered[i].y;
+        sse += dx * dx + dy * dy;
+    }
+    r.reproj_px = std::sqrt(sse / static_cast<double>(proj.size()));
+    if (r.reproj_px > kMaxPnPReproj) return r;    // 解不可信
+
+    r.ok = true;
+    r.x = tvec[0];
+    r.y = tvec[1];
+    r.z = tvec[2];
+    r.dist_mm = std::hypot(tvec[0], tvec[1], tvec[2]);
+    r.yaw_deg = std::atan2(tvec[0], tvec[2]) * 180.0 / CV_PI;
+    // 相机 y 向下，所以靶在上方时 tvec[1] < 0；取负号让"上"为正
+    r.los_pitch_deg = -std::atan2(tvec[1], std::hypot(tvec[0], tvec[2])) * 180.0 / CV_PI;
+    return r;
+}
+
+// 低伸弹道：给定水平距离 d 与相对枪口的高度差 h，求发射角（弧度）。
+// tan(theta) = (v^2 - sqrt(v^4 - g(g d^2 + 2 h v^2))) / (g d)
+// 返回 false 表示这个距离打不到（判别式 < 0）。
+bool ballisticPitch(double v, double d, double h, double g, double* theta_rad) {
+    if (d <= 1e-6 || v <= 1e-6) return false;
+    const double v2 = v * v;
+    const double disc = v2 * v2 - g * (g * d * d + 2.0 * h * v2);
+    if (disc < 0.0) return false;
+    *theta_rad = std::atan((v2 - std::sqrt(disc)) / (g * d));
+    return true;
+}
+
+// 飞行时间：t = d / (v cos(theta))
+double flightTime(double v, double d, double theta_rad) {
+    if (v <= 1e-6) return 0.0;
+    return d / (v * std::cos(theta_rad));
 }
 
 // ============================================================================
@@ -914,6 +1065,7 @@ int main(int argc, char** argv) {
     double last_model_t = 0.0;
     bool has_last_model = false;
     int gate_rejects = 0;         // 被模型门限拒掉的帧数
+    double r_est = -1.0;          // 自动估计的转盘半径（-1 = 还没估出来）
 
     double fps = cap.get(cv::CAP_PROP_FPS);
     if (fps <= 1.0) fps = 30.0;
@@ -931,7 +1083,7 @@ int main(int argc, char** argv) {
     if (!log_path.empty()) {
         logf.open(log_path);
         logf << "frame,t,theta_deg,w,rms_deg,pred_deg,armed_angle,plates,leds,"
-                "mask_px,a,b,data_age\n";
+                "mask_px,a,b,data_age,dist_mm,yaw_deg,pitch_cmd,reproj_px,lead_s\n";
         std::cout << "日志写入 " << log_path << "\n";
     }
 
@@ -978,6 +1130,28 @@ int main(int argc, char** argv) {
         cv::Mat mask = buildMask(frame, ranges, wheel, P.roi_scale * P.wheel_rpx, &hch);
         const int mask_px = cv::countNonZero(mask);   // 记进日志，用来查灯光闪烁
         std::vector<Led> leds = detectLeds(mask, hch, wheel, P.wheel_rpx, P, &st);
+
+        // 自动估计转盘半径：灯条质心相对轮心的半径，中位数就约等于 R。
+        //   4 条灯对称分布，平均半径正好是 R（径向两条在 R±47.5，切向两条在 R±3.2）
+        // 这样换相机、换距离、甚至拿测试视频跑，都不用改 px_per_mm。
+        // 只做缓慢收敛，避免单帧噪声让圆圈抖动。
+        if (P.auto_rpx && leds.size() >= 4) {
+            std::vector<double> rr;
+            rr.reserve(leds.size());
+            for (const auto& l : leds) {
+                cv::Point2f d = l.center - wheel;
+                rr.push_back(std::hypot(d.x, d.y));
+            }
+            std::nth_element(rr.begin(), rr.begin() + rr.size() / 2, rr.end());
+            const double med = rr[rr.size() / 2];
+            if (r_est < 0.0) {
+                r_est = med;
+            } else {
+                r_est += 0.08 * (med - r_est);   // 一阶低通
+            }
+            P.wheel_rpx = r_est;
+        }
+
         std::vector<Plate> plates = assignSlots(leds, wheel, P.wheel_rpx, P);
 
         // 待激活靶必须唯一
@@ -1033,6 +1207,7 @@ int main(int argc, char** argv) {
         if (data_age > P.history_reset_age) {
             history.clear();
             has_last_model = false;     // 模型也一起作废
+            tracker.reset();            // 相位连续性也丢掉，否则大跳变会永久卡死
         }
         // 顺便剪掉过老的样本，防止内存无限增长
         while (!history.empty() && history.front().first < t_now - 3.0 * P.fit_window_s) {
@@ -1048,6 +1223,36 @@ int main(int argc, char** argv) {
             has_last_model = true;
         }
 
+        // ---- ⑧ 位姿解算 + 弹道 ----
+        // 只用"待激活靶"的 4 条灯做 PnP：2 条灯点不够，解不出来。
+        PoseResult pose;
+        double lead_total = P.lead_s;        // 默认只用视觉延迟
+        double pitch_cmd_deg = 0.0;
+        double h_rel = 0.0;
+        if (armed >= 0 && plates[armed].bars.size() == 4) {
+            std::vector<cv::Point2f> pts;
+            pts.reserve(4);
+            for (int bi : plates[armed].bars) pts.push_back(leds[bi].center);
+
+            pose = solvePlatePose(pts, P);
+            if (pose.ok) {
+                const double d_m = pose.dist_mm / 1000.0;
+                // 靶相对【枪口】的高度差：相机在枪管上方，
+                // 所以从枪口看，靶比从相机看要更高一点
+                h_rel = d_m * std::tan(pose.los_pitch_deg * CV_PI / 180.0)
+                        + P.muzzle_offset_mm / 1000.0;
+
+                double theta_rad = 0.0;
+                if (ballisticPitch(P.ball_speed, d_m, h_rel, P.g_acc, &theta_rad)) {
+                    const double t_fly = flightTime(P.ball_speed, d_m, theta_rad);
+                    // 弹道抬升 + 实弹标定的经验修正
+                    pitch_cmd_deg = theta_rad * 180.0 / CV_PI + P.pitch_bias_deg;
+                    // 提前量要包含飞行时间，否则永远打晚
+                    lead_total = P.pipeline_delay + t_fly;
+                }
+            }
+        }
+
         // ---- ⑥ 预测 ----
         // 数据过期就不预测了：模型是按几百毫秒前拟合的，外推出去是瞎猜
         bool fresh = (data_age <= P.max_pred_age);
@@ -1056,7 +1261,7 @@ int main(int argc, char** argv) {
         if (has_model && fresh && tracker.has() && armed >= 0) {
             pred = predictTarget(model, theta,
                                  plates[armed].angle_deg * CV_PI / 180.0,
-                                 P.lead_s) * 180.0 / CV_PI;
+                                 lead_total) * 180.0 / CV_PI;
             ready = true;
         }
 
@@ -1070,7 +1275,12 @@ int main(int argc, char** argv) {
                  << (armed >= 0 ? plates[armed].angle_deg : 0.0) << ','
                  << plates.size() << ',' << leds.size() << ',' << mask_px << ','
                  << (has_model ? model.a : 0.0) << ','
-                 << (has_model ? model.b : 0.0) << ',' << data_age << '\n';
+                 << (has_model ? model.b : 0.0) << ',' << data_age << ','
+                 << (pose.ok ? pose.dist_mm : 0.0) << ','
+                 << (pose.ok ? pose.yaw_deg : 0.0) << ','
+                 << (pose.ok ? pitch_cmd_deg : 0.0) << ','
+                 << (pose.ok ? pose.reproj_px : 0.0) << ','
+                 << lead_total << '\n';
         }
 
         if (idx % 30 == 0) {
@@ -1136,12 +1346,17 @@ int main(int argc, char** argv) {
         }
 
         // 预测位置：在圆周上画一个小方块，直观看到"打向哪"
-        if (ready) {
+        // 半径用"当前待激活靶"的真实半径，而不是配置里的名义 R_px。
+        // 否则配置的 px_per_mm 和实际画面尺度不一致时，方块会偏离靶环（角度对、位置错）。
+        if (ready && armed >= 0) {
+            cv::Point2f rel = plates[armed].center - wheel;
+            const double r_now = std::hypot(rel.x, rel.y);
+            const double ang_now = std::atan2(rel.y, rel.x);
+            const double d_ang = (pred - plates[armed].angle_deg) * CV_PI / 180.0;
             for (int half = 0; half < 2; ++half) {
                 cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
-                double a = pred * CV_PI / 180.0;
-                cv::Point2f p(wheel.x + static_cast<float>(P.wheel_rpx * std::cos(a)) + off.x,
-                              wheel.y + static_cast<float>(P.wheel_rpx * std::sin(a)) + off.y);
+                cv::Point2f p(wheel.x + static_cast<float>(r_now * std::cos(ang_now + d_ang)) + off.x,
+                              wheel.y + static_cast<float>(r_now * std::sin(ang_now + d_ang)) + off.y);
                 cv::drawMarker(both, p, cv::Scalar(0, 255, 255), cv::MARKER_DIAMOND, 22, 2);
             }
         }
@@ -1181,6 +1396,20 @@ int main(int argc, char** argv) {
         }
         cv::putText(both, th, cv::Point(15, 70), cv::FONT_HERSHEY_SIMPLEX, 0.65,
                     cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+        // 位姿与弹道
+        char pq[192];
+        if (pose.ok) {
+            std::snprintf(pq, sizeof(pq),
+                          "d=%.0fmm  yaw=%+.2f  pitch=%.2f  lead=%.3fs  rep=%.2fpx",
+                          pose.dist_mm, pose.yaw_deg, pitch_cmd_deg, lead_total,
+                          pose.reproj_px);
+        } else {
+            std::snprintf(pq, sizeof(pq), "PnP invalid (need 4 bars)");
+        }
+        cv::putText(both, pq, cv::Point(15, 140), cv::FONT_HERSHEY_SIMPLEX, 0.65,
+                    pose.ok ? cv::Scalar(255, 200, 0) : cv::Scalar(0, 128, 255), 2,
+                    cv::LINE_AA);
 
         // ---- 显示 ----
         //   默认显示"原图 | 掩膜"复合画面

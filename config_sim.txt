@@ -1,0 +1,45 @@
+# 针对 py_sim 生成数据集的临时参数（生成器用 fx=1907、无畸变、1280x960）
+exposure = -8
+wb = 4600
+gain = 0
+wheel_x = -1
+wheel_y = -1
+px_per_mm = 0.9779
+auto_rpx = 1
+roi_scale = 1.6
+min_area = 20
+max_area = 2500
+min_aspect = 1.2
+min_extent = 0.70
+max_hue_std = 6.0
+group_gap_deg = 25
+radius_tol = 0.45
+fit_window_s = 1.5
+min_fit_samples = 20
+omega_min = 1.884
+omega_max = 2.000
+omega_step = 0.004
+max_fit_rms = 0.05
+min_osc_amp = 0.05
+ab_tol = 0.20
+lead_s = 0.10
+max_pred_age = 0.25
+history_reset_age = 1.0
+model_gate = 1.5
+
+# 生成器用的内参：fx = 0.9779 * 1950 = 1907，主点 (640,480)，无畸变
+fx = 1906.9
+fy = 1906.9
+cx = 640
+cy = 480
+k1 = 0
+k2 = 0
+p1 = 0
+p2 = 0
+k3 = 0
+
+bar_offset_mm = 47.5
+ball_speed = 12
+muzzle_offset_mm = 75
+pipeline_delay = 0.10
+pitch_bias_deg = 0
