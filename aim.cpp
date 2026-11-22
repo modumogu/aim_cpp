@@ -49,13 +49,14 @@
 #include <opencv2/opencv.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
-#include <fstream>
 
 #ifdef _WIN32
 #define NOMINMAX          // 否则 windows.h 的 min/max 宏会打散 std::min/std::max
@@ -163,6 +164,151 @@ struct HsvRange {
     cv::Scalar lo;
     cv::Scalar hi;
 };
+
+// ============================================================================
+//  可调参数
+//    上面的 constexpr 是"出厂默认值"，这里的 Params 是"本次运行实际用的值"。
+//    优先级： 命令行 > config.txt > 上面的默认值
+//    这样现场改个数字不用重新编译。
+// ============================================================================
+struct Params {
+    // 相机
+    double exposure = kDefExposure;
+    double wb_temp = kDefWbTemp;
+    double gain = 0.0;
+
+    // 转盘在画面里的位置与尺度（现场标定）
+    double wheel_x = -1.0;                       // -1 表示用画面中心
+    double wheel_y = -1.0;
+    double px_per_mm = kPxPerMm;                 // 每毫米多少像素
+    double wheel_rpx = kDefWheelRpx;             // 由 px_per_mm 推出，可单独覆盖
+    double roi_scale = kRoiScale;
+
+    // 灯条形状
+    double min_area = kMinLedArea;
+    double max_area = kMaxLedArea;
+    double min_aspect = kMinAspect;
+    double min_extent = kMinExtent;
+    double max_hue_std = kMaxHueStdDeg;
+
+    // 槽位归组
+    double group_gap_deg = kGroupGapDeg;
+    double radius_tol = kRadiusTol;
+
+    // 拟合
+    double fit_window_s = kFitWindowS;
+    int min_fit_samples = kMinFitSamples;
+    double omega_min = kOmegaMin;
+    double omega_max = kOmegaMax;
+    double omega_step = kOmegaStep;
+    double max_fit_rms = kMaxFitRms;
+    double min_osc_amp = kMinOscAmp;
+    double ab_tol = kAbTol;
+
+    // 预测与门限
+    double lead_s = kLeadS;
+    double max_pred_age = kMaxPredAge;
+    double history_reset_age = kHistoryResetAge;
+    double model_gate = kModelGateRad;           // 弧度
+};
+
+std::string trimStr(const std::string& s) {
+    const char* ws = " \t\r\n";
+    size_t a = s.find_first_not_of(ws);
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(ws);
+    return s.substr(a, b - a + 1);
+}
+
+// 读 config.txt。
+//   · 支持 UTF-8 BOM
+//   · '#' 之后整行当注释，所以可以写中文注释
+//   · 只认 "键 = 值"，键名不区分大小写
+//   · 不认识的键会打警告，打字错误不会被静默吞掉
+bool loadParams(const std::string& path, Params* P) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    int applied = 0;
+    std::string line;
+    bool first = true;
+    while (std::getline(f, line)) {
+        if (first) {
+            first = false;
+            if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+                static_cast<unsigned char>(line[1]) == 0xBB &&
+                static_cast<unsigned char>(line[2]) == 0xBF) {
+                line.erase(0, 3);   // UTF-8 BOM
+            }
+        }
+        size_t h = line.find('#');
+        if (h != std::string::npos) line = line.substr(0, h);
+        line = trimStr(line);
+        if (line.empty()) continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = trimStr(line.substr(0, eq));
+        std::string v = trimStr(line.substr(eq + 1));
+        if (k.empty() || v.empty()) continue;
+        for (auto& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        try {
+            if (k == "exposure")            P->exposure = std::stod(v);
+            else if (k == "wb")             P->wb_temp = std::stod(v);
+            else if (k == "gain")           P->gain = std::stod(v);
+            else if (k == "wheel_x")        P->wheel_x = std::stod(v);
+            else if (k == "wheel_y")        P->wheel_y = std::stod(v);
+            else if (k == "px_per_mm")      { P->px_per_mm = std::stod(v);
+                                              P->wheel_rpx = 350.0 * P->px_per_mm; }
+            else if (k == "wheel_rpx")      P->wheel_rpx = std::stod(v);
+            else if (k == "roi_scale")      P->roi_scale = std::stod(v);
+            else if (k == "min_area")       P->min_area = std::stod(v);
+            else if (k == "max_area")       P->max_area = std::stod(v);
+            else if (k == "min_aspect")     P->min_aspect = std::stod(v);
+            else if (k == "min_extent")     P->min_extent = std::stod(v);
+            else if (k == "max_hue_std")    P->max_hue_std = std::stod(v);
+            else if (k == "group_gap_deg")  P->group_gap_deg = std::stod(v);
+            else if (k == "radius_tol")     P->radius_tol = std::stod(v);
+            else if (k == "fit_window_s")   P->fit_window_s = std::stod(v);
+            else if (k == "min_fit_samples")P->min_fit_samples = std::stoi(v);
+            else if (k == "omega_min")      P->omega_min = std::stod(v);
+            else if (k == "omega_max")      P->omega_max = std::stod(v);
+            else if (k == "omega_step")     P->omega_step = std::stod(v);
+            else if (k == "max_fit_rms")    P->max_fit_rms = std::stod(v);
+            else if (k == "min_osc_amp")    P->min_osc_amp = std::stod(v);
+            else if (k == "ab_tol")         P->ab_tol = std::stod(v);
+            else if (k == "lead_s")         P->lead_s = std::stod(v);
+            else if (k == "max_pred_age")   P->max_pred_age = std::stod(v);
+            else if (k == "history_reset_age") P->history_reset_age = std::stod(v);
+            else if (k == "model_gate")     P->model_gate = std::stod(v) * CV_PI / 180.0;
+            else {
+                std::cout << "[config] 未知键 \"" << k << "\"，已忽略\n";
+                continue;
+            }
+            ++applied;
+        } catch (...) {
+            std::cout << "[config] 值解析失败: " << k << " = " << v << "\n";
+        }
+    }
+    std::cout << "[config] 从 " << path << " 读取了 " << applied << " 项\n";
+    return applied > 0;
+}
+
+void printParams(const Params& P) {
+    std::printf("[参数] exposure=%.2f wb=%.0f gain=%.2f\n", P.exposure, P.wb_temp, P.gain);
+    std::printf("[参数] wheel=(%.0f,%.0f) px_per_mm=%.4f R_px=%.1f roi=%.2f\n",
+                P.wheel_x, P.wheel_y, P.px_per_mm, P.wheel_rpx, P.roi_scale);
+    std::printf("[参数] area=[%.0f,%.0f] aspect>=%.2f extent>=%.2f hue_sd<=%.1f\n",
+                P.min_area, P.max_area, P.min_aspect, P.min_extent, P.max_hue_std);
+    std::printf("[参数] gap=%.1fdeg radius_tol=%.2f\n", P.group_gap_deg, P.radius_tol);
+    std::printf("[参数] fit: win=%.2fs n>=%d w=[%.3f,%.3f]/%.3f rms<=%.3f osc>=%.2f\n",
+                P.fit_window_s, P.min_fit_samples, P.omega_min, P.omega_max,
+                P.omega_step, P.max_fit_rms, P.min_osc_amp);
+    std::printf("[参数] lead=%.3fs age<=%.3fs reset=%.1fs gate=%.2fdeg ab_tol=%.3f\n",
+                P.lead_s, P.max_pred_age, P.history_reset_age,
+                P.model_gate * 180.0 / CV_PI, P.ab_tol);
+}
 
 // 三种颜色各自的 HSV 区间。
 //   红色：H 跨 0 和 179 两端，必须两段
@@ -272,7 +418,7 @@ double hueCircularStdDeg(const cv::Mat& hch, const std::vector<cv::Point>& c) {
 }
 
 std::vector<Led> detectLeds(const cv::Mat& mask, const cv::Mat& hch, cv::Point2f wheel,
-                            double R_px, double radius_tol, RejectStats* st) {
+                            double R_px, const Params& P, RejectStats* st) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (st) st->raw = static_cast<int>(contours.size());
@@ -280,7 +426,7 @@ std::vector<Led> detectLeds(const cv::Mat& mask, const cv::Mat& hch, cv::Point2f
     std::vector<Led> leds;
     for (const auto& c : contours) {
         double area = cv::contourArea(c);
-        if (area < kMinLedArea || area > kMaxLedArea) {
+        if (area < P.min_area || area > P.max_area) {
             if (st) ++st->by_area;
             continue;
         }
@@ -293,15 +439,15 @@ std::vector<Led> detectLeds(const cv::Mat& mask, const cv::Mat& hch, cv::Point2f
             continue;
         }
         double aspect = hi / lo;
-        if (aspect < kMinAspect) {
+        if (aspect < P.min_aspect) {
             if (st) ++st->by_aspect;
             continue;
         }
 
         // 填充度 = 轮廓面积 / 最小外接矩形面积。
-        // 圆角矩形实测 0.837~0.931；眩光、反光点形状不规则，明显更低。
+        // 圆角矩形实测 0.873~0.915；眩光、反光点形状不规则，明显更低。
         const double extent = area / (w * h);
-        if (extent < kMinExtent) {
+        if (extent < P.min_extent) {
             if (st) ++st->by_extent;
             continue;
         }
@@ -309,7 +455,7 @@ std::vector<Led> detectLeds(const cv::Mat& mask, const cv::Mat& hch, cv::Point2f
         // 色相一致性：真实 LED 是单色，H 的环形标准差很小
         if (!hch.empty()) {
             const double sd = hueCircularStdDeg(hch, c);
-            if (sd > kMaxHueStdDeg) {
+            if (sd > P.max_hue_std) {
                 if (st) ++st->by_hue;
                 continue;
             }
@@ -331,7 +477,7 @@ std::vector<Led> detectLeds(const cv::Mat& mask, const cv::Mat& hch, cv::Point2f
         // 离轮心太远的红色块一定不是灯条，早点扔掉还能少一次聚簇运算。
         cv::Point2f d = led.center - wheel;
         double r = std::hypot(d.x, d.y);
-        if (std::fabs(r - R_px) > radius_tol * R_px) {
+        if (std::fabs(r - R_px) > P.radius_tol * R_px) {
             if (st) ++st->by_radius;
             continue;
         }
@@ -353,7 +499,7 @@ struct Plate {
 };
 
 std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
-                               double R_px) {
+                               double R_px, const Params& P) {
     struct Item {
         int idx;
         double ang;
@@ -412,7 +558,7 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
         cur.clear();
     };
     for (size_t k = 1; k < items.size(); ++k) {
-        if (items[k].ang - items[k - 1].ang < kGroupGapDeg) {
+        if (items[k].ang - items[k - 1].ang < P.group_gap_deg) {
             cur.push_back(items[k]);
         } else {
             flush();
@@ -533,24 +679,24 @@ bool solve4(double A[4][4], const double b[4], double x[4]) {
 // 否则丢帧时拟合还以为现在停在最后一次成功的那一帧，
 // 会拿过期的模型外推，预测出来的角度对应的是几百毫秒前。
 bool fitMotion(const std::vector<std::pair<double, double>>& history, double t_now,
-               double ab_tol, MotionModel* out) {
-    if (static_cast<int>(history.size()) < kMinFitSamples) return false;
+               const Params& P, MotionModel* out) {
+    if (static_cast<int>(history.size()) < P.min_fit_samples) return false;
 
     std::vector<double> ts, ys;
     for (const auto& p : history) {
-        if (p.first >= t_now - kFitWindowS && p.first <= t_now) {
+        if (p.first >= t_now - P.fit_window_s && p.first <= t_now) {
             ts.push_back(p.first - t_now);   // 以"现在"为原点，数值更稳
             ys.push_back(p.second);
         }
     }
-    if (static_cast<int>(ts.size()) < kMinFitSamples) return false;
+    if (static_cast<int>(ts.size()) < P.min_fit_samples) return false;
 
     double best_rms = 1e18;
     double best_w = 0.0;
     double best_c[4] = {0.0, 0.0, 0.0, 0.0};
 
     // ω 网格搜索：每个候选解一次最小二乘，留残差最小的
-    for (double w = kOmegaMin; w <= kOmegaMax + 1e-9; w += kOmegaStep) {
+    for (double w = P.omega_min; w <= P.omega_max + 1e-9; w += P.omega_step) {
         double A[4][4] = {{0}};
         double b[4] = {0, 0, 0, 0};
         for (size_t i = 0; i < ts.size(); ++i) {
@@ -578,7 +724,7 @@ bool fitMotion(const std::vector<std::pair<double, double>>& history, double t_n
         }
     }
 
-    if (best_rms > kMaxFitRms) return false;   // 残差大 -> 不可信，HOLD
+    if (best_rms > P.max_fit_rms) return false;   // 残差大 -> 不可信，HOLD
 
     out->omega = best_w;
     out->rms = best_rms;
@@ -594,8 +740,8 @@ bool fitMotion(const std::vector<std::pair<double, double>>& history, double t_n
     // 手册约束：b = 2.090 − a，即 a + b 恒等于 2.090。
     // 只在确实存在正弦摆动时检查——小机关(a=0,b≈1.047)、固定靶(a=b=0)
     // 的 a+b 远不是 2.090，无条件检查会全部误杀。
-    if (out->a > kMinOscAmp &&
-        std::fabs(out->a + out->b - kAbSum) > ab_tol) {
+    if (out->a > P.min_osc_amp &&
+        std::fabs(out->a + out->b - kAbSum) > P.ab_tol) {
         return false;   // 物理上不成立，说明拟合到了错误的对象
     }
     return true;
@@ -663,17 +809,25 @@ int main(int argc, char** argv) {
     bool show_raw = false;      // 纯相机画面（按 p 切换）
     int want_index = -1;
     int max_frames = 1;
-    double exposure = kDefExposure;
-    double wb_temp = kDefWbTemp;
-    double wheel_x = -1.0;
-    double wheel_y = -1.0;
-    double R_px = kDefWheelRpx;
-    double gain = 0.0;              // 固定增益，避免自动增益放大噪声
-    double roi_scale = kRoiScale;   // ROI 半径 = roi_scale × R_px，0 = 关闭
-    double ab_tol = kAbTol;         // a+b 约束容差（弧度），现场可放宽/收紧
-    double model_gate = kModelGateRad;   // 模型门限（弧度），--gate 以度为单位
     std::string color = "red";      // red / blue / yellow
     std::string video_path, save_path, log_path;
+    std::string config_path = "config.txt";   // 默认读同目录下的 config.txt
+
+    // 先扫一遍命令行，只为了找 --config：配置文件要最先读，
+    // 这样后面的命令行参数才能覆盖它（优先级 命令行 > config > 默认值）
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
+        }
+    }
+
+    Params P;
+    if (loadParams(config_path, &P)) {
+        // 读到了
+    } else {
+        std::cout << "[config] 未找到或为空: " << config_path << "，使用默认值\n";
+    }
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -683,14 +837,14 @@ int main(int argc, char** argv) {
         } else if (a == "--index" && i + 1 < argc) {
             want_index = std::stoi(argv[++i]);
         } else if (a == "--expo" && i + 1 < argc) {
-            exposure = std::stod(argv[++i]);
+            P.exposure = std::stod(argv[++i]);
         } else if (a == "--wb" && i + 1 < argc) {
-            wb_temp = std::stod(argv[++i]);
+            P.wb_temp = std::stod(argv[++i]);
         } else if (a == "--wheel" && i + 2 < argc) {
-            wheel_x = std::stod(argv[++i]);
-            wheel_y = std::stod(argv[++i]);
+            P.wheel_x = std::stod(argv[++i]);
+            P.wheel_y = std::stod(argv[++i]);
         } else if (a == "--rpx" && i + 1 < argc) {
-            R_px = std::stod(argv[++i]);
+            P.wheel_rpx = std::stod(argv[++i]);
         } else if (a == "--save" && i + 1 < argc) {
             headless = true;
             save_path = argv[++i];
@@ -703,19 +857,21 @@ int main(int argc, char** argv) {
         } else if (a == "--log" && i + 1 < argc) {
             log_path = argv[++i];
         } else if (a == "--gain" && i + 1 < argc) {
-            gain = std::stod(argv[++i]);
+            P.gain = std::stod(argv[++i]);
         } else if (a == "--roi" && i + 1 < argc) {
-            roi_scale = std::stod(argv[++i]);
+            P.roi_scale = std::stod(argv[++i]);
         } else if (a == "--abtol" && i + 1 < argc) {
-            ab_tol = std::stod(argv[++i]);
+            P.ab_tol = std::stod(argv[++i]);
         } else if (a == "--gate" && i + 1 < argc) {
-            model_gate = std::stod(argv[++i]) * CV_PI / 180.0;   // 输入是度
+            P.model_gate = std::stod(argv[++i]) * CV_PI / 180.0;   // 输入是度
         }
     }
 
+    printParams(P);
+
     cv::VideoCapture cap;
     if (use_camera) {
-        int idx = openCamera(cap, want_index, exposure, wb_temp, gain);
+        int idx = openCamera(cap, want_index, P.exposure, P.wb_temp, P.gain);
         if (idx < 0) {
             std::cerr << "没找到能跑 1280x1024 的相机。\n"
                          "检查：1) USB 线插紧  2) 拔掉无线键鼠接收器（会抢带宽）"
@@ -796,16 +952,16 @@ int main(int argc, char** argv) {
         }
 
         if (!wheel_set) {
-            if (wheel_x < 0 || wheel_y < 0) {
+            if (P.wheel_x < 0 || P.wheel_y < 0) {
                 wheel = cv::Point2f(frame.cols * 0.5f, frame.rows * 0.5f);
             } else {
-                wheel = cv::Point2f(static_cast<float>(wheel_x),
-                                    static_cast<float>(wheel_y));
+                wheel = cv::Point2f(static_cast<float>(P.wheel_x),
+                                    static_cast<float>(P.wheel_y));
             }
             wheel_set = true;
-            const double roi_r = roi_scale * R_px;
+            const double roi_r = P.roi_scale * P.wheel_rpx;
             std::cout << "轮心 (" << wheel.x << ", " << wheel.y
-                      << ")   半径 " << R_px << " px"
+                      << ")   半径 " << P.wheel_rpx << " px"
                       << "   ROI " << (roi_r > 1.0 ? std::to_string((int)roi_r) + " px" : "关闭")
                       << "\n";
         }
@@ -819,10 +975,10 @@ int main(int argc, char** argv) {
 
         RejectStats st;
         cv::Mat hch;
-        cv::Mat mask = buildMask(frame, ranges, wheel, roi_scale * R_px, &hch);
+        cv::Mat mask = buildMask(frame, ranges, wheel, P.roi_scale * P.wheel_rpx, &hch);
         const int mask_px = cv::countNonZero(mask);   // 记进日志，用来查灯光闪烁
-        std::vector<Led> leds = detectLeds(mask, hch, wheel, R_px, kRadiusTol, &st);
-        std::vector<Plate> plates = assignSlots(leds, wheel, R_px);
+        std::vector<Led> leds = detectLeds(mask, hch, wheel, P.wheel_rpx, P, &st);
+        std::vector<Plate> plates = assignSlots(leds, wheel, P.wheel_rpx, P);
 
         // 待激活靶必须唯一
         // 用 >= 4 而不是 == 4：噪点可能让一块靶聚出 5 条灯，
@@ -850,14 +1006,14 @@ int main(int argc, char** argv) {
         // 用上一帧的模型外推本帧的 theta，对不上就作废这帧的相位，
         // 防止单帧误检把累加的 theta 永久带偏（PhaseTracker 只拦 >28.8 度的大跳）
         if (has_phase && has_last_model && last_valid_t >= 0.0 &&
-            (t_now - last_valid_t) <= kMaxPredAge) {
+            (t_now - last_valid_t) <= P.max_pred_age) {
             const double dt = t_now - last_model_t;
             const double th_pred =
                 last_model.c[0] + last_model.c[1] * dt +
                 last_model.c[2] * std::cos(last_model.omega * dt) +
                 last_model.c[3] * std::sin(last_model.omega * dt);
             const double candidate = tracker.peek(has_phase, raw_phase);
-            if (std::fabs(candidate - th_pred) > model_gate) {
+            if (std::fabs(candidate - th_pred) > P.model_gate) {
                 has_phase = false;      // 这帧不可信，本帧不更新 theta
                 ++gate_rejects;
             }
@@ -874,18 +1030,18 @@ int main(int argc, char** argv) {
             data_age = (last_valid_t < 0.0) ? 1e9 : (t_now - last_valid_t);
         }
         // 丢帧太久，历史已经不可信（转盘可能换了模式/被复位），清空重新积累
-        if (data_age > kHistoryResetAge) {
+        if (data_age > P.history_reset_age) {
             history.clear();
             has_last_model = false;     // 模型也一起作废
         }
         // 顺便剪掉过老的样本，防止内存无限增长
-        while (!history.empty() && history.front().first < t_now - 3.0 * kFitWindowS) {
+        while (!history.empty() && history.front().first < t_now - 3.0 * P.fit_window_s) {
             history.erase(history.begin());
         }
 
         // ---- ⑤ 拟合（用当前时刻做时间原点，不用最后一个样本的时间）----
         MotionModel model;
-        bool has_model = fitMotion(history, t_now, ab_tol, &model);
+        bool has_model = fitMotion(history, t_now, P, &model);
         if (has_model) {
             last_model = model;
             last_model_t = t_now;
@@ -894,13 +1050,13 @@ int main(int argc, char** argv) {
 
         // ---- ⑥ 预测 ----
         // 数据过期就不预测了：模型是按几百毫秒前拟合的，外推出去是瞎猜
-        bool fresh = (data_age <= kMaxPredAge);
+        bool fresh = (data_age <= P.max_pred_age);
         bool ready = false;
         double pred = 0.0;
         if (has_model && fresh && tracker.has() && armed >= 0) {
             pred = predictTarget(model, theta,
                                  plates[armed].angle_deg * CV_PI / 180.0,
-                                 kLeadS) * 180.0 / CV_PI;
+                                 P.lead_s) * 180.0 / CV_PI;
             ready = true;
         }
 
@@ -928,7 +1084,7 @@ int main(int argc, char** argv) {
                 std::printf("  w=%.3f a=%.3f b=%.3f rms=%.2f", model.omega, model.a,
                             model.b, model.rms * 180.0 / CV_PI);
             }
-            if (data_age > kMaxPredAge) {
+            if (data_age > P.max_pred_age) {
                 std::printf("  age=%.0fms  HOLD", data_age * 1000.0);
             } else if (ready) {
                 std::printf("  age=%.0fms  pred %.1f  READY", data_age * 1000.0, pred);
@@ -954,12 +1110,12 @@ int main(int argc, char** argv) {
             cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
             cv::Point2f wc = wheel + off;
             cv::drawMarker(both, wc, cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 24, 2);
-            cv::circle(both, wc, static_cast<int>(R_px), cv::Scalar(90, 90, 90), 1,
+            cv::circle(both, wc, static_cast<int>(P.wheel_rpx), cv::Scalar(90, 90, 90), 1,
                        cv::LINE_AA);
             for (int s = 0; s < kSlotCount; ++s) {
                 double a = s * (360.0 / kSlotCount) * CV_PI / 180.0;
-                cv::Point2f e(wc.x + static_cast<float>(R_px * std::cos(a)),
-                              wc.y + static_cast<float>(R_px * std::sin(a)));
+                cv::Point2f e(wc.x + static_cast<float>(P.wheel_rpx * std::cos(a)),
+                              wc.y + static_cast<float>(P.wheel_rpx * std::sin(a)));
                 cv::line(both, wc, e, cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
             }
         }
@@ -984,8 +1140,8 @@ int main(int argc, char** argv) {
             for (int half = 0; half < 2; ++half) {
                 cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
                 double a = pred * CV_PI / 180.0;
-                cv::Point2f p(wheel.x + static_cast<float>(R_px * std::cos(a)) + off.x,
-                              wheel.y + static_cast<float>(R_px * std::sin(a)) + off.y);
+                cv::Point2f p(wheel.x + static_cast<float>(P.wheel_rpx * std::cos(a)) + off.x,
+                              wheel.y + static_cast<float>(P.wheel_rpx * std::sin(a)) + off.y);
                 cv::drawMarker(both, p, cv::Scalar(0, 255, 255), cv::MARKER_DIAMOND, 22, 2);
             }
         }
