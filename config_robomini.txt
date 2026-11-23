@@ -84,8 +84,7 @@ omega_max = 2.000
 omega_step = 0.004
 max_fit_rms = 0.05
 min_osc_amp = 0.05
-ab_tol = 0.20
-
+ab_tol = 0.30
 lead_s = 0.10
 max_pred_age = 0.25
 history_reset_age = 1.0
@@ -137,3 +136,6 @@ pitch_bias_deg = 0
 # ---------------------------------------------------------------------------
 # 颜色不在这里配，用命令行 --color red|blue 切换（默认 red）。
 # 仿真 launch 的 side:=blue / side:=red 要和这个对应。
+
+# 重力加速度，只在做弹道计算时用，一般不用改
+g_acc = 9.8

@@ -50,6 +50,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -325,6 +326,7 @@ bool loadParams(const std::string& path, Params* P) {
             else if (k == "muzzle_offset_mm") P->muzzle_offset_mm = std::stod(v);
             else if (k == "pipeline_delay") P->pipeline_delay = std::stod(v);
             else if (k == "pitch_bias_deg") P->pitch_bias_deg = std::stod(v);
+            else if (k == "g_acc")          P->g_acc = std::stod(v);
             else if (k == "camera_pitch_deg") P->camera_pitch_deg = std::stod(v);
             else if (k == "camera_yaw_deg")   P->camera_yaw_deg = std::stod(v);
             else {
@@ -354,6 +356,17 @@ void printParams(const Params& P) {
     std::printf("[参数] lead=%.3fs age<=%.3fs reset=%.1fs gate=%.2fdeg ab_tol=%.3f\n",
                 P.lead_s, P.max_pred_age, P.history_reset_age,
                 P.model_gate * 180.0 / CV_PI, P.ab_tol);
+    // 相机内参：PnP 全靠它，改没改成功必须能一眼看出来
+    std::printf("[参数] K: fx=%.2f fy=%.2f cx=%.2f cy=%.2f\n",
+                P.fx, P.fy, P.cx, P.cy);
+    std::printf("[参数] D: k1=%.4f k2=%.4f p1=%.4f p2=%.4f k3=%.4f\n",
+                P.k1, P.k2, P.p1, P.p2, P.k3);
+    // 靶几何与弹道
+    std::printf("[参数] bar_offset=%.2fmm ball_v=%.2fm/s muzzle_dy=%.1fmm\n",
+                P.bar_offset_mm, P.ball_speed, P.muzzle_offset_mm);
+    std::printf("[参数] pipeline=%.3fs bias=%.2fdeg cam_pitch=%.2fdeg cam_yaw=%.2fdeg y_scale=%.4f\n",
+                P.pipeline_delay, P.pitch_bias_deg, P.camera_pitch_deg,
+                P.camera_yaw_deg, P.y_scale);
 }
 
 // 三种颜色各自的 HSV 区间。
@@ -821,6 +834,13 @@ double predictTarget(const MotionModel& m, double theta_now, double angle_now,
     return angle_now + (theta_future - theta_now);
 }
 
+// θ(t_now + dt) − θ(t_now)。模型以"现在"为时间原点，所以 c0 就是 θ(t_now)。
+//   = c1·dt + c2·(cos(ω·dt) − 1) + c3·sin(ω·dt)
+double thetaIncrement(const MotionModel& m, double dt) {
+    return m.c[1] * dt + m.c[2] * (std::cos(m.omega * dt) - 1.0) +
+           m.c[3] * std::sin(m.omega * dt);
+}
+
 // ============================================================================
 //  ⑧ 位姿解算（solvePnP）+ 弹道补偿
 //
@@ -933,6 +953,129 @@ double flightTime(double v, double d, double theta_rad) {
 }
 
 // ============================================================================
+//  ⑦ 命中点解算（迭代）
+//
+//  为什么必须迭代：
+//     pitch  依赖 靶在命中时刻的高度
+//     靶高    依赖 弹丸飞行期间转过多少角度
+//     转过多 依赖 飞行时间
+//     飞行时间 依赖 pitch
+//  这是个循环依赖。只算一遍等于假设靶在飞行期间不动。
+//  实测（1950mm、110°/s、弹速 12）：这样会带来最大 5.3° 的 pitch 偏差，
+//  而靶盘在 1950mm 处的半张角只有 2.86°——偏出 186%，必脱靶。
+//
+//  同一套迭代还顺手修掉了 yaw：原来 yaw 用的是【当前】方位角，没有提前量。
+//  改成从命中时刻的 3D 位置反推，两者同时正确。
+// ============================================================================
+constexpr int kHitIters = 4;          // 迭代次数，3~4 次即收敛
+constexpr double kHitLeadTol = 1e-4;  // 提前量收敛判据（秒）
+
+struct HitSolution {
+    bool ok = false;
+    double yaw_deg = 0.0;
+    double pitch_deg = 0.0;
+    double t_fly = 0.0;
+    double lead = 0.0;
+    cv::Point3d p_hit;      // 命中时刻靶心，相机系 mm
+    double dtheta_deg = 0.0;  // 最后一次迭代用到的相位增量（诊断用）
+    int iters = 0;
+    double residual = 0.0;  // 最后一次迭代提前量的变化量
+};
+
+// 轮盘是竖直的、正对相机，所以"轮心 → 靶心"这个径向向量就在图像平面内。
+// 于是命中时刻的靶心 = 轮心 + Rot_z(Δθ) · (靶心 − 轮心)。
+//
+// 入参：
+//   pose      当前靶心的 PnP 结果（相机系 mm）
+//   wheel_px  轮心的图像坐标
+//   plate_px  当前靶心的图像坐标
+//   model     运动模型；传 nullptr 表示没有模型（固定不动，Δθ = 0）
+HitSolution solveHit(const PoseResult& pose, cv::Point2f wheel_px, cv::Point2f plate_px,
+                     const MotionModel* model, const Params& P) {
+    HitSolution r;
+    if (!pose.ok || P.fx <= 1.0 || P.fy <= 1.0) return r;
+
+    // ---- 轮心 → 靶心 的 3D 径向向量（mm）----
+    // 图像上差 dn 像素，在深度 Z 处对应 dn·Z/f 毫米。
+    const double dx = plate_px.x - wheel_px.x;
+    const double dy = plate_px.y - wheel_px.y;
+    const double vx = dx * pose.z / P.fx;
+    const double vy = dy * pose.z / P.fy;
+    if (std::hypot(vx, vy) < 1.0) return r;   // 靶心几乎压在轮心上，退化
+
+    const cv::Point3d Pcur(pose.x, pose.y, pose.z);
+    const cv::Point3d wheel3(Pcur.x - vx, Pcur.y - vy, Pcur.z);
+
+    // ---- 迭代 ----
+    double lead = P.pipeline_delay;
+    double prev_lead = -1.0;
+    for (int it = 0; it < kHitIters; ++it) {
+        // 命中时刻相对现在转过了多少相位
+        const double dth = model ? thetaIncrement(*model, lead) : 0.0;
+        const double c = std::cos(dth), s = std::sin(dth);
+        const cv::Point3d Phit(wheel3.x + vx * c - vy * s,
+                               wheel3.y + vx * s + vy * c,
+                               wheel3.z);
+
+        // 由命中点算视线角：相机 y 向下，所以靶在上方时 y < 0
+        const double dist3 = std::sqrt(Phit.x * Phit.x + Phit.y * Phit.y + Phit.z * Phit.z);
+        const double los = std::atan2(-Phit.y, std::hypot(Phit.x, Phit.z));
+        const double elev = los + P.camera_pitch_deg * CV_PI / 180.0;
+        const double d_h = (dist3 / 1000.0) * std::cos(elev);
+        const double h_rel = d_h * std::tan(elev) + P.muzzle_offset_mm / 1000.0;
+
+        double theta_rad = 0.0;
+        if (!ballisticPitch(P.ball_speed, d_h, h_rel, P.g_acc, &theta_rad)) {
+            return r;   // 这个距离打不到
+        }
+        const double t_fly = flightTime(P.ball_speed, d_h, theta_rad);
+
+        r.p_hit = Phit;
+        r.dtheta_deg = dth * 180.0 / CV_PI;
+        r.iters = it + 1;
+        r.t_fly = t_fly;
+        r.pitch_deg = theta_rad * 180.0 / CV_PI + P.pitch_bias_deg;
+        r.yaw_deg = std::atan2(Phit.x, Phit.z) * 180.0 / CV_PI + P.camera_yaw_deg;
+
+        const double new_lead = P.pipeline_delay + t_fly;
+        r.residual = std::fabs(new_lead - lead);
+        lead = new_lead;
+        r.lead = lead;
+        r.ok = true;
+        if (r.residual < kHitLeadTol) break;
+        (void)prev_lead;
+        prev_lead = lead;
+    }
+    return r;
+}
+
+
+// 存图。cv::imwrite 在中文路径下会静默失败（返回 false 但不报错，也不建文件），
+// 所以失败时退回 imencode + ofstream 的写法。项目路径全是中文，必须走这条路。
+bool saveImage(const std::string& path, const cv::Mat& img) {
+    if (img.empty() || path.empty()) return false;
+    try {
+        if (cv::imwrite(path, img)) return true;
+    } catch (...) {
+        // imwrite 对中文路径可能直接抛异常，继续走后备方案
+    }
+    try {
+        std::string ext = ".png";
+        const size_t dot = path.find_last_of('.');
+        if (dot != std::string::npos) ext = path.substr(dot);
+        std::vector<uchar> buf;
+        if (!cv::imencode(ext, img, buf)) return false;
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<const char*>(buf.data()),
+                static_cast<std::streamsize>(buf.size()));
+        return f.good();
+    } catch (...) {
+        return false;
+    }
+}
+
+// ============================================================================
 //  打开相机
 // ============================================================================
 int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double wb_temp,
@@ -981,7 +1124,7 @@ int main(int argc, char** argv) {
     bool headless = false;
     bool show_raw = false;      // 纯相机画面（按 p 切换）
     int want_index = -1;
-    int max_frames = 1;
+    int max_frames = 0;         // 0 = 不限；>0 时跑够这么多帧就退出（--frames）
     std::string color = "red";      // red / blue / yellow
     std::string video_path, save_path, log_path;
     std::string config_path = "config.txt";   // 默认读同目录下的 config.txt
@@ -1023,6 +1166,8 @@ int main(int argc, char** argv) {
             save_path = argv[++i];
         } else if (a == "--frames" && i + 1 < argc) {
             max_frames = std::stoi(argv[++i]);
+        } else if (a == "--headless") {
+            headless = true;      // 不显示窗口（自查脚本用，避免误弹出画面）
         } else if (a == "--raw") {
             show_raw = true;        // 启动时就是纯相机画面
         } else if (a == "--color" && i + 1 < argc) {
@@ -1109,10 +1254,20 @@ int main(int argc, char** argv) {
     if (!log_path.empty()) {
         logf.open(log_path);
         logf << "frame,t,theta_deg,w,rms_deg,pred_deg,armed_angle,plates,leds,"
-                "mask_px,a,b,data_age,dist_mm,yaw_deg,pitch_cmd,reproj_px,lead_s\n";
+                "mask_px,a,b,data_age,dist_mm,yaw_deg,pitch_cmd,reproj_px,lead_s,dtheta_deg,hit_y_mm,pred_minus_armed\n";
         std::cout << "日志写入 " << log_path << "\n";
     }
 
+    // 分段计时（毫秒），结束时打印，用来找性能瓶颈
+    using HrClock = std::chrono::high_resolution_clock;
+    double t_mask = 0, t_detect = 0, t_slots = 0, t_phase = 0, t_fit = 0;
+    double t_pnp = 0, t_pred = 0, t_draw = 0, t_total = 0;
+    auto tick = []() { return HrClock::now(); };
+    auto ms = [](HrClock::time_point a) {
+        return std::chrono::duration<double, std::milli>(HrClock::now() - a).count();
+    };
+    bool did_save = false;     // --save 是否已经存过图
+    cv::Mat last_both;         // 最后一帧的合成画面，供退出时补存
     while (true) {
         cv::Mat frame;
         cap >> frame;
@@ -1153,9 +1308,14 @@ int main(int argc, char** argv) {
 
         RejectStats st;
         cv::Mat hch;
+        auto tp_frame = tick();
+        auto tp = tick();
         cv::Mat mask = buildMask(frame, ranges, wheel, P.roi_scale * P.wheel_rpx, &hch);
+        t_mask += ms(tp);
         const int mask_px = cv::countNonZero(mask);   // 记进日志，用来查灯光闪烁
+        tp = tick();
         std::vector<Led> leds = detectLeds(mask, hch, wheel, P.wheel_rpx, P, &st);
+        t_detect += ms(tp);
 
         // 自动估计转盘半径：灯条质心相对轮心的半径，中位数就约等于 R。
         //   4 条灯对称分布，平均半径正好是 R（径向两条在 R±47.5，切向两条在 R±3.2）
@@ -1178,7 +1338,9 @@ int main(int argc, char** argv) {
             P.wheel_rpx = r_est;
         }
 
+        tp = tick();
         std::vector<Plate> plates = assignSlots(leds, wheel, P.wheel_rpx, P);
+        t_slots += ms(tp);
 
         // 待激活靶必须唯一
         // 用 >= 4 而不是 == 4：噪点可能让一块靶聚出 5 条灯，
@@ -1195,7 +1357,9 @@ int main(int argc, char** argv) {
 
         // ---- ④ 相位解缠 ----
         double raw_phase = 0.0;
+        tp = tick();
         bool has_phase = estimatePhase(plates, &raw_phase);
+        t_phase += ms(tp);
 
         // 时间戳：视频按帧号/帧率，相机用真实时钟
         const double t_now = use_camera
@@ -1242,47 +1406,38 @@ int main(int argc, char** argv) {
 
         // ---- ⑤ 拟合（用当前时刻做时间原点，不用最后一个样本的时间）----
         MotionModel model;
+        tp = tick();
         bool has_model = fitMotion(history, t_now, P, &model);
+        t_fit += ms(tp);
         if (has_model) {
             last_model = model;
             last_model_t = t_now;
             has_last_model = true;
         }
 
-        // ---- ⑧ 位姿解算 + 弹道 ----
+        // ---- ⑧ 位姿解算 + 命中点迭代 ----
         // 只用"待激活靶"的 4 条灯做 PnP：2 条灯点不够，解不出来。
         PoseResult pose;
-        double lead_total = P.lead_s;        // 默认只用视觉延迟
+        HitSolution hit;
+        double lead_total = P.lead_s;        // 没有 PnP 时的兜底
         double pitch_cmd_deg = 0.0;
         double yaw_cmd_deg = 0.0;
-        double h_rel = 0.0;
         if (armed >= 0 && plates[armed].bars.size() == 4) {
             std::vector<cv::Point2f> pts;
             pts.reserve(4);
             for (int bi : plates[armed].bars) pts.push_back(leds[bi].geom);   // 用补偿后的点，否则倾斜会让深度偏
 
+            tp = tick();
             pose = solvePlatePose(pts, P);
-            if (pose.ok) {
-                // 把"相对相机光轴"的视线角换算到"相对云台零位（水平面）"。
-                // 相机固定在基座上时通常要抬头一点，不补这个偏移，
-                // 弹道的高度差就会算错，pitch 跟着错。
-                const double elev_deg = pose.los_pitch_deg + P.camera_pitch_deg;
-                const double yaw_deg = pose.yaw_deg + P.camera_yaw_deg;
-                const double elev = elev_deg * CV_PI / 180.0;
+            t_pnp += ms(tp);
 
-                // 水平距离（不是直线距离）与靶相对枪口的高度差
-                const double d_h = (pose.dist_mm / 1000.0) * std::cos(elev);
-                h_rel = d_h * std::tan(elev) + P.muzzle_offset_mm / 1000.0;
-
-                double theta_rad = 0.0;
-                if (ballisticPitch(P.ball_speed, d_h, h_rel, P.g_acc, &theta_rad)) {
-                    const double t_fly = flightTime(P.ball_speed, d_h, theta_rad);
-                    // 弹道抬升 + 实弹标定的经验修正
-                    pitch_cmd_deg = theta_rad * 180.0 / CV_PI + P.pitch_bias_deg;
-                    // 提前量要包含飞行时间，否则永远打晚
-                    lead_total = P.pipeline_delay + t_fly;
-                }
-                yaw_cmd_deg = yaw_deg;
+            // 命中时刻的靶位置：迭代求解 pitch ⇄ 飞行时间 的循环依赖，
+            // 同时把 yaw 也从命中位置算出来（原来 yaw 用的是当前方位，没有提前量）
+            hit = solveHit(pose, wheel, plates[armed].center, has_model ? &model : nullptr, P);
+            if (hit.ok) {
+                yaw_cmd_deg = hit.yaw_deg;
+                pitch_cmd_deg = hit.pitch_deg;
+                lead_total = hit.lead;
             }
         }
 
@@ -1313,7 +1468,11 @@ int main(int argc, char** argv) {
                  << (pose.ok ? pose.yaw_deg : 0.0) << ','
                  << (pose.ok ? pitch_cmd_deg : 0.0) << ','
                  << (pose.ok ? pose.reproj_px : 0.0) << ','
-                 << lead_total << '\n';
+                 << lead_total << ','
+                 << hit.dtheta_deg << ','
+                 << (hit.ok ? hit.p_hit.y : 0.0) << ','
+                 << (ready && armed >= 0 ? pred - plates[armed].angle_deg : 0.0)
+                 << '\n';
         }
 
         // 掩膜的主色相（诊断用）。换相机/换环境时先看这个数对不对：
@@ -1341,11 +1500,51 @@ int main(int argc, char** argv) {
             }
         }
 
+        // 掩膜是空的 = 一个灯条都没进掩膜。最常见的原因就是 --color 配错。
+        // 这里统计整幅图里"亮像素"的主色相，直接提示该用哪个颜色。
+        if (mask_px == 0 && idx % 30 == 0) {
+            cv::Mat hsv_all;
+            cv::cvtColor(frame, hsv_all, cv::COLOR_BGR2HSV);
+            double bx = 0.0, by = 0.0;
+            int cnt = 0;
+            for (int y = 0; y < hsv_all.rows; y += 2) {
+                const uchar* hr = hsv_all.ptr<uchar>(y);
+                for (int x = 0; x < hsv_all.cols; x += 2) {
+                    const uchar H = hr[x * 3], S = hr[x * 3 + 1], V = hr[x * 3 + 2];
+                    if (V < 110 || S < 50) continue;   // 只看又亮又有色的像素
+                    const double a = H * 2.0 * CV_PI / 180.0;
+                    bx += std::cos(a);
+                    by += std::sin(a);
+                    ++cnt;
+                }
+            }
+            if (cnt > 50) {
+                double d = std::atan2(by, bx) * 180.0 / CV_PI;
+                if (d < 0.0) d += 360.0;
+                const double H = d / 2.0;   // 回到 0~179 刻度
+                const char* guess = "未知";
+                if (H < 13.0 || H > 166.0) guess = "red";
+                else if (H >= 13.0 && H <= 46.0) guess = "yellow";
+                else if (H >= 88.0 && H <= 142.0) guess = "blue";
+                std::printf("[警告] 掩膜为空！画面亮部主色相 H=%.0f，看起来是 %s\n", H, guess);
+                if (color != guess) {
+                    std::printf("[警告] 当前位置 --color %s 与该颜色不符，试试 --color %s\n",
+                                color.c_str(), guess);
+                } else {
+                    std::printf("[警告] 颜色参数是对的，说明是饱和度/亮度阈值卡住了，"
+                                "把 S、V 下限调低试试\n");
+                }
+            } else {
+                std::printf("[警告] 掩膜为空，且画面里几乎没有又亮又有色的像素"
+                            "（检查曝光/增益/镜头盖）\n");
+            }
+        }
+
         if (idx % 30 == 0) {
-            std::printf("frame %d  轮廓 %d → 面积 %d 长宽比 %d 填充度 %d 色相 %d 半径 %d"
-                        " → 灯条 %d  靶 %d",
-                        idx, st.raw, st.by_area, st.by_aspect, st.by_extent, st.by_hue,
-                        st.by_radius, static_cast<int>(leds.size()),
+            std::printf("frame %d  R=%.1f  轮廓 %d → 面积 %d 长宽比 %d 填充度 %d "
+                        "色相 %d 半径 %d → 灯条 %d  靶 %d",
+                        idx, P.wheel_rpx, st.raw, st.by_area, st.by_aspect, st.by_extent,
+                        st.by_hue, st.by_radius, static_cast<int>(leds.size()),
                         static_cast<int>(plates.size()));
             if (tracker.has()) std::printf("  theta %.1f", tracker.thetaDeg());
             if (has_model) {
@@ -1362,10 +1561,18 @@ int main(int argc, char** argv) {
             std::printf("  gate拒 %d  maskH %.0f\n", gate_rejects, mask_hue);
         }
 
+        // 纯相机模式（比赛用）不需要合成图，也不需要任何叠加绘制。
+        // 这一段原本每帧要 cvtColor + hconcat 出一张 2560x960 的图，实测 1.7ms。
+        cv::Mat both;
+        if (show_raw) {
+            last_both = frame;      // 这种模式下 --save 存的就是原图
+        } else {
         cv::Mat mask_bgr;
         cv::cvtColor(mask, mask_bgr, cv::COLOR_GRAY2BGR);
-        cv::Mat both;
+        tp = tick();
         cv::hconcat(frame, mask_bgr, both);
+        t_draw += ms(tp);
+        last_both = both;
 
         for (size_t k = 0; k < leds.size(); ++k) {
             const cv::Point2f& p = leds[k].center;
@@ -1380,8 +1587,11 @@ int main(int argc, char** argv) {
             cv::drawMarker(both, wc, cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 24, 2);
             cv::circle(both, wc, static_cast<int>(P.wheel_rpx), cv::Scalar(90, 90, 90), 1,
                        cv::LINE_AA);
+            // 槽位射线：槽位在 theta + i×72° 上，所以必须从 theta 起画，
+            // 否则五条线固定不动，跟转动的靶子对不上。
+            const double slot_base = tracker.has() ? tracker.thetaDeg() : 0.0;
             for (int s = 0; s < kSlotCount; ++s) {
-                double a = s * (360.0 / kSlotCount) * CV_PI / 180.0;
+                double a = (slot_base + s * (360.0 / kSlotCount)) * CV_PI / 180.0;
                 cv::Point2f e(wc.x + static_cast<float>(P.wheel_rpx * std::cos(a)),
                               wc.y + static_cast<float>(P.wheel_rpx * std::sin(a)));
                 cv::line(both, wc, e, cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
@@ -1403,10 +1613,20 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 预测位置：在圆周上画一个小方块，直观看到"打向哪"
-        // 半径用"当前待激活靶"的真实半径，而不是配置里的名义 R_px。
-        // 否则配置的 px_per_mm 和实际画面尺度不一致时，方块会偏离靶环（角度对、位置错）。
-        if (ready && armed >= 0) {
+        // 命中点：直接把 solveHit 算出的命中时刻 3D 位置投影回图像画标记。
+        // 这样标记画的就是"真正要打的那一点"，不再是当前靶心。
+        if (hit.ok && P.fx > 1.0) {
+            const double zz = hit.p_hit.z;
+            if (zz > 1.0) {
+                const float u = static_cast<float>(P.fx * hit.p_hit.x / zz + P.cx);
+                const float v = static_cast<float>(P.fy * hit.p_hit.y / zz + P.cy);
+                for (int half = 0; half < 2; ++half) {
+                    cv::Point2f off(static_cast<float>(half) * frame.cols, 0.0f);
+                    cv::drawMarker(both, cv::Point2f(u, v) + off, cv::Scalar(0, 255, 255),
+                                   cv::MARKER_DIAMOND, 22, 2);
+                }
+            }
+        } else if (ready && armed >= 0) {
             cv::Point2f rel = plates[armed].center - wheel;
             const double r_now = std::hypot(rel.x, rel.y);
             const double ang_now = std::atan2(rel.y, rel.x);
@@ -1468,6 +1688,7 @@ int main(int argc, char** argv) {
         cv::putText(both, pq, cv::Point(15, 140), cv::FONT_HERSHEY_SIMPLEX, 0.65,
                     pose.ok ? cv::Scalar(255, 200, 0) : cv::Scalar(0, 128, 255), 2,
                     cv::LINE_AA);
+        }   // end if (!show_raw)
 
         // ---- 显示 ----
         //   默认显示"原图 | 掩膜"复合画面
@@ -1488,14 +1709,26 @@ int main(int argc, char** argv) {
                 cv::imshow(win_name, both);
             }
         }
+        t_total += ms(tp_frame);
         ++idx;
 
-        if (headless) {
-            if (idx >= max_frames) {
-                cv::imwrite(save_path, both);
-                std::cout << "已存 " << save_path << "\n";
-                break;
+        // --frames 必须在两种模式下都生效。
+        // 之前只在 headless 分支里检查，带窗口运行时该参数被完全忽略，
+        // 导致自查脚本以为只跑 1 帧、实际把整段视频放完了（窗口一直开着）。
+        if (max_frames > 0 && idx >= max_frames) {
+            if (!save_path.empty()) {
+                const cv::Mat& out_img = show_raw ? frame : both;
+                if (saveImage(save_path, out_img)) {
+                    std::cout << "已存 " << save_path << "\n";
+                } else {
+                    std::cout << "存图失败: " << save_path << "\n";
+                }
+                did_save = true;
             }
+            break;
+        }
+
+        if (headless) {
             continue;
         }
 
@@ -1505,13 +1738,34 @@ int main(int argc, char** argv) {
         if (key == 's' || key == 'S') {          // 按 s 存一张当前画面
             char name[64];
             std::snprintf(name, sizeof(name), "shot_%04d.png", idx);
-            cv::imwrite(name, show_raw ? frame : both);
+            if (!saveImage(name, show_raw ? frame : both)) {
+                std::cout << "截图失败\n";
+            }
             std::cout << "已截图 " << name << "\n";
+        }
+    }
+
+    // 走到这里说明视频读完了或被 ESC 提前退出。
+    // 如果指定了 --save 但还没在帧数上限处存过，就把最后一帧存下来，
+    // 这样"只给 --save 不给 --frames"也能得到一张图。
+    if (!save_path.empty() && !did_save && !last_both.empty()) {
+        if (saveImage(save_path, last_both)) {
+            std::cout << "已存 " << save_path << "\n";
+        } else {
+            std::cout << "存图失败: " << save_path << "\n";
         }
     }
 
     cap.release();
     cv::destroyAllWindows();
+    if (idx > 0) {
+        const double n = static_cast<double>(idx);
+        std::printf("[耗时] 平均每帧 %.2f ms (=%.0f fps)\n", t_total / n, 1000.0 * n / t_total);
+        std::printf("[耗时]   掩膜 %.2f  灯条 %.2f  归组 %.2f  相位 %.2f  拟合 %.2f  "
+                    "PnP %.2f  绘制 %.2f\n",
+                    t_mask / n, t_detect / n, t_slots / n, t_phase / n, t_fit / n,
+                    t_pnp / n, t_draw / n);
+    }
     std::cout << "处理了 " << idx << " 帧\n";
     return 0;
 }
