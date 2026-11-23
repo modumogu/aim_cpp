@@ -152,6 +152,9 @@ constexpr double kModelGateRad = 1.5 * CV_PI / 180.0;
 // PnP 反投影误差上限（像素）。超过说明 4 个点的对应关系错了或位姿不可信。
 constexpr double kMaxPnPReproj = 3.0;
 
+// PnP 失败后允许沿用上次成功位姿的最长时间（秒）
+constexpr double kPoseReuseAge = 0.20;
+
 // ---- 形状/颜色一致性过滤 ---------------------------------------------------
 // 灯条是矩形（官方几何 41x20mm，长宽比 2.05）。
 // 实测（带光晕）填充度 0.873~0.915；1px 抗锯齿的理论下限约 0.87。
@@ -239,6 +242,15 @@ struct Params {
     double camera_pitch_deg = 0.0;
     double camera_yaw_deg = 0.0;
     double y_scale = 1.0;            // 竖直补偿系数 = 1/cos(camera_pitch_deg)，派生量
+
+    // S/V 阈值自适应：解决"曝光/白平衡一变就全灭"
+    //   adaptive = clamp(ROI内P99 × adapt_ratio, adapt_min, 255)
+    //   实际下限 = min(配置里的原阈值, adaptive)  —— 只会放宽，永不收紧
+    double adapt_sv = 1.0;           // 0 关闭，回到固定阈值
+    double adapt_ratio = 0.45;
+    double adapt_min = 45.0;
+    double adapt_max_gain = 4.0;     // 亮度补偿的最大倍数
+    double adapt_gain_below = 110.0; // 只有 P99 低于这个值才补增益（真暗才补）
 };
 
 std::string trimStr(const std::string& s) {
@@ -327,6 +339,11 @@ bool loadParams(const std::string& path, Params* P) {
             else if (k == "pipeline_delay") P->pipeline_delay = std::stod(v);
             else if (k == "pitch_bias_deg") P->pitch_bias_deg = std::stod(v);
             else if (k == "g_acc")          P->g_acc = std::stod(v);
+            else if (k == "adapt_sv")       P->adapt_sv = std::stod(v);
+            else if (k == "adapt_ratio")    P->adapt_ratio = std::stod(v);
+            else if (k == "adapt_min")      P->adapt_min = std::stod(v);
+            else if (k == "adapt_max_gain") P->adapt_max_gain = std::stod(v);
+            else if (k == "adapt_gain_below") P->adapt_gain_below = std::stod(v);
             else if (k == "camera_pitch_deg") P->camera_pitch_deg = std::stod(v);
             else if (k == "camera_yaw_deg")   P->camera_yaw_deg = std::stod(v);
             else {
@@ -384,10 +401,44 @@ std::vector<HsvRange> rangesForColor(const std::string& color) {
     } else if (color == "yellow") {
         v.push_back({cv::Scalar(15, 50, 150), cv::Scalar(45, 255, 255)});
     } else {   // red（默认）
-        v.push_back({cv::Scalar(0, 120, 120), cv::Scalar(10, 255, 255)});
-        v.push_back({cv::Scalar(170, 120, 120), cv::Scalar(179, 255, 255)});
+        // 压力测试：光源 6500K、白平衡仍锁 4600K 时，红条 H 会从 ~3 漂到 ~139
+        // （偏品红）。原区间 [0,10]+[170,179] 完全覆盖不到，直接全灭。
+        // 放宽到 [0,15]+[158,179]，可容纳 ±1500K 的白平衡失配。
+        // 与蓝色区间 [92,138] 不重叠，不会互相抢。
+        // 第一段 [0,12]：实测暖光下红灯核心 H≈4，而灯条光晕是 H≈13~15 的橙色，
+        //   放宽到 15 会把光晕放进来（暖光工况下灯条数从 4 涨到 16）。
+        // 第二段 [158,179]：冷光 6500K 时红灯核心会漂到 H≈160，靠这一段兜住。
+        v.push_back({cv::Scalar(0, 120, 120), cv::Scalar(12, 255, 255)});
+        v.push_back({cv::Scalar(158, 120, 120), cv::Scalar(179, 255, 255)});
     }
     return v;
+}
+
+// 在 ROI 圆内统计某通道的高分位数（P99），用 256 桶直方图 + 4 像素采样。
+//   chan: 1 = S，2 = V
+int roiChannelP99(const cv::Mat& hsv, cv::Point2f wheel, double roi_r, int chan) {
+    int hist[256] = {0};
+    const int step = 4;
+    const double r2 = roi_r * roi_r;
+    int n = 0;
+    for (int y = 0; y < hsv.rows; y += step) {
+        const uchar* row = hsv.ptr<uchar>(y);
+        const double dy = static_cast<double>(y) - wheel.y;
+        for (int x = 0; x < hsv.cols; x += step) {
+            const double dx = static_cast<double>(x) - wheel.x;
+            if (dx * dx + dy * dy > r2) continue;
+            ++hist[row[x * 3 + chan]];
+            ++n;
+        }
+    }
+    if (n < 16) return 255;
+    const int target = static_cast<int>(n * 0.99);
+    int acc = 0;
+    for (int v = 0; v < 256; ++v) {
+        acc += hist[v];
+        if (acc >= target) return v;
+    }
+    return 255;
 }
 
 // ============================================================================
@@ -395,15 +446,112 @@ std::vector<HsvRange> rangesForColor(const std::string& color) {
 //     ROI 圆：只保留转盘周围的像素，顶灯/墙面反光在圆外，一步排掉。
 //     同时把 H 通道回传出去，后面算色相一致性要用。
 // ============================================================================
+// V = max(B,G,R)，在 ROI 内取 P99。用来判断画面是不是整体偏暗。
+int roiBrightP99(const cv::Mat& bgr, cv::Point2f wheel, double roi_r) {
+    int hist[256] = {0};
+    const int step = 4;
+    const double r2 = roi_r * roi_r;
+    int n = 0;
+    for (int y = 0; y < bgr.rows; y += step) {
+        const uchar* row = bgr.ptr<uchar>(y);
+        const double dy = static_cast<double>(y) - wheel.y;
+        for (int x = 0; x < bgr.cols; x += step) {
+            const double dx = static_cast<double>(x) - wheel.x;
+            if (dx * dx + dy * dy > r2) continue;
+            const uchar b = row[x * 3], g = row[x * 3 + 1], r = row[x * 3 + 2];
+            ++hist[std::max(b, std::max(g, r))];
+            ++n;
+        }
+    }
+    if (n < 16) return 255;
+    const int target = static_cast<int>(n * 0.99);
+    int acc = 0;
+    for (int v = 0; v < 256; ++v) {
+        acc += hist[v];
+        if (acc >= target) return v;
+    }
+    return 255;
+}
+
+// 统计"最亮那批像素"的 S 中位数。
+//   v_min 取 Vp99 的 85%，基本只保留灯条核心，避免背景高光把中位数拉低。
+int roiBrightSMedian(const cv::Mat& hsv, cv::Point2f wheel, double roi_r, int v_min) {
+    int hist[256] = {0};
+    const int step = 4;
+    const double r2 = roi_r * roi_r;
+    int n = 0;
+    for (int y = 0; y < hsv.rows; y += step) {
+        const uchar* row = hsv.ptr<uchar>(y);
+        const double dy = static_cast<double>(y) - wheel.y;
+        for (int x = 0; x < hsv.cols; x += step) {
+            const double dx = static_cast<double>(x) - wheel.x;
+            if (dx * dx + dy * dy > r2) continue;
+            if (row[x * 3 + 2] < v_min) continue;      // V 不够亮，跳过
+            ++hist[row[x * 3 + 1]];                    // 记 S
+            ++n;
+        }
+    }
+    if (n < 8) return 255;
+    const int target = n / 2;
+    int acc = 0;
+    for (int s = 0; s < 256; ++s) {
+        acc += hist[s];
+        if (acc >= target) return s;
+    }
+    return 255;
+}
+
 cv::Mat buildMask(const cv::Mat& bgr, const std::vector<HsvRange>& ranges,
-                  cv::Point2f wheel, double roi_radius, cv::Mat* h_out) {
+                  cv::Point2f wheel, double roi_radius, cv::Mat* h_out,
+                  const Params& P_adapt) {
+    // ---- 亮度补偿（软件自动曝光）----
+    // 画面对暗时，直接压低 V 阈值会把背景噪声一起放进来（实测轮廓从 10 涨到 2242）。
+    // 正确做法是先把整幅图补到正常亮度，V 阈值保持不动。
+    cv::Mat src = bgr;
+    cv::Mat gained;
+    int s_floor = 0;
+    if (P_adapt.adapt_sv > 0.5) {
+        const double rr = (roi_radius > 1.0) ? roi_radius
+                                             : std::hypot(bgr.cols, bgr.rows);
+        const int vp = roiBrightP99(bgr, wheel, rr);
+        if (vp > 10 && vp < P_adapt.adapt_gain_below) {
+            const double gain = std::min(P_adapt.adapt_max_gain, 200.0 / vp);
+            if (gain > 1.02) {
+                cv::convertScaleAbs(bgr, gained, gain, 0.0);
+                src = gained;
+            }
+        }
+    }
+
     cv::Mat hsv;
-    cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+    cv::cvtColor(src, hsv, cv::COLOR_BGR2HSV);
+
+    // ---- 饱和度下限自适应 ----
+    // 只动 S：褪色时红灯会变成粉色，S 掉到 70 上下，固定 120 就全灭。
+    // V 阈值不参与自适应，避免暗噪声涌入。
+    if (P_adapt.adapt_sv > 0.5) {
+        const double rr = (roi_radius > 1.0) ? roi_radius
+                                             : std::hypot(hsv.cols, hsv.rows);
+        const int vp = roiBrightP99(src, wheel, rr);
+        const int v_thr = static_cast<int>(vp * 0.85);
+        const int sb = roiBrightSMedian(hsv, wheel, rr, v_thr);
+        // 只有"最亮的东西本身就偏淡"时才放宽 S（褪色的情形）。
+        // 暖光/正常光下灯条 S 都在 160 以上，此时绝不动阈值，
+        // 否则会把暖色调的背景放进掩膜。
+        if (sb < 120) {
+            s_floor = std::max(static_cast<int>(P_adapt.adapt_min),
+                               static_cast<int>(sb * 0.8));
+            s_floor = std::min(s_floor, 119);
+        }
+    }
 
     cv::Mat mask = cv::Mat::zeros(hsv.size(), CV_8UC1);
     for (const auto& r : ranges) {
+        cv::Scalar lo = r.lo;
+        if (s_floor > 0) lo[1] = std::min(static_cast<double>(lo[1]),
+                                          static_cast<double>(s_floor));
         cv::Mat m;
-        cv::inRange(hsv, r.lo, r.hi, m);
+        cv::inRange(hsv, lo, r.hi, m);
         cv::bitwise_or(mask, m, mask);
     }
 
@@ -617,6 +765,24 @@ std::vector<Plate> assignSlots(const std::vector<Led>& leds, cv::Point2f wheel,
                 c += leds[it.idx].geom;
             }
             c *= 1.0f / static_cast<float>(cur.size());
+            // 只有 3 条灯时，质心不是盘心。取"相距最远的两条"的中点：
+            // 相对的两条灯相距 2×47.5mm，共线且中点即盘心。
+            if (cur.size() == 3) {
+                int bi = 0, bj = 1;
+                float best = -1.0f;
+                for (int i = 0; i < 3; ++i) {
+                    for (int j = i + 1; j < 3; ++j) {
+                        const cv::Point2f d = leds[cur[i].idx].geom - leds[cur[j].idx].geom;
+                        const float dd = d.x * d.x + d.y * d.y;
+                        if (dd > best) {
+                            best = dd;
+                            bi = i;
+                            bj = j;
+                        }
+                    }
+                }
+                c = (leds[cur[bi].idx].geom + leds[cur[bj].idx].geom) * 0.5f;
+            }
             p.center = c;
             cv::Point2f d = c - wheel;
             double a = std::atan2(d.y, d.x) * 180.0 / CV_PI;
@@ -1237,6 +1403,9 @@ int main(int argc, char** argv) {
     bool has_last_model = false;
     int gate_rejects = 0;         // 被模型门限拒掉的帧数
     double r_est = -1.0;          // 自动估计的转盘半径（-1 = 还没估出来）
+    PoseResult last_pose;         // 最近一次成功的 PnP 位姿
+    double last_pose_t = -1.0;
+    int pose_reuse = 0;           // 沿用了多少次上次位姿
 
     double fps = cap.get(cv::CAP_PROP_FPS);
     if (fps <= 1.0) fps = 30.0;
@@ -1310,7 +1479,7 @@ int main(int argc, char** argv) {
         cv::Mat hch;
         auto tp_frame = tick();
         auto tp = tick();
-        cv::Mat mask = buildMask(frame, ranges, wheel, P.roi_scale * P.wheel_rpx, &hch);
+        cv::Mat mask = buildMask(frame, ranges, wheel, P.roi_scale * P.wheel_rpx, &hch, P);
         t_mask += ms(tp);
         const int mask_px = cv::countNonZero(mask);   // 记进日志，用来查灯光闪烁
         tp = tick();
@@ -1353,7 +1522,20 @@ int main(int argc, char** argv) {
                 ++armed_count;
             }
         }
-        if (armed_count != 1) armed = -1;
+        // 一块 4 灯都没有时退一步：唯一一块 3 灯大概率是"4 灯被挡掉一条"。
+        // 压力测试：只遮住一条灯条，原逻辑会直接找不到待激活靶，
+        // 整条链路（相位、预测、PnP）全部失效。
+        if (armed_count != 1) {
+            armed = -1;
+            int c3 = 0;
+            for (size_t k = 0; k < plates.size(); ++k) {
+                if (plates[k].state == 3) {
+                    if (armed < 0) armed = static_cast<int>(k);
+                    ++c3;
+                }
+            }
+            if (c3 != 1) armed = -1;
+        }
 
         // ---- ④ 相位解缠 ----
         double raw_phase = 0.0;
@@ -1430,6 +1612,19 @@ int main(int argc, char** argv) {
             tp = tick();
             pose = solvePlatePose(pts, P);
             t_pnp += ms(tp);
+
+            // 遮挡兜底：IPPE 必须 4 个共面点，被挡掉一条就解不出来。
+            // 此时沿用最近一次成功的位姿（限 0.2 秒内）。靶的距离在几十毫秒内
+            // 几乎不变，沿用比整帧丢掉瞄准解要好得多。
+            if (!pose.ok && last_pose.ok && last_pose_t >= 0.0 &&
+                (t_now - last_pose_t) < kPoseReuseAge) {
+                pose = last_pose;
+                ++pose_reuse;
+            }
+            if (pose.ok) {
+                last_pose = pose;
+                last_pose_t = t_now;
+            }
 
             // 命中时刻的靶位置：迭代求解 pitch ⇄ 飞行时间 的循环依赖，
             // 同时把 yaw 也从命中位置算出来（原来 yaw 用的是当前方位，没有提前量）
@@ -1558,7 +1753,9 @@ int main(int argc, char** argv) {
             } else {
                 std::printf("  age=%.0fms  HOLD", data_age * 1000.0);
             }
-            std::printf("  gate拒 %d  maskH %.0f\n", gate_rejects, mask_hue);
+            std::printf("  gate拒 %d  maskH %.0f", gate_rejects, mask_hue);
+            if (pose_reuse > 0) std::printf("  位姿沿用 %d", pose_reuse);
+            std::printf("\n");
         }
 
         // 纯相机模式（比赛用）不需要合成图，也不需要任何叠加绘制。
