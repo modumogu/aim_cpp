@@ -61,10 +61,10 @@ max_area = 2500
 min_aspect = 1.2
 
 # 填充度：23x11 的矩形四边各蚀掉半像素约 0.87，取 0.65 留余量
-min_extent = 0.65
+min_extent = 0.50
 
 # 色相一致性（度）
-max_hue_std = 6.0
+max_hue_std = 12.0
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +79,15 @@ radius_tol = 0.45
 # ---------------------------------------------------------------------------
 fit_window_s = 1.5
 min_fit_samples = 20
+# 最小拟合时间跨度（秒）。只有样本数不够：高帧率下 20 帧可能只覆盖 0.16 秒，
+# 正弦拟合会欠定。60fps 时 20 帧=0.33s，129fps 时只有 0.16s。
+min_fit_span_s = 0.30
+
+# 运行时帧率看门狗（只对相机模式生效）。低于 fps_warn_low 持续 2 秒就报警，
+# 恢复到 fps_warn_high 以上重新布防。现场掉帧多是中途插了 USB 设备抢带宽。
+fps_warn_low = 50
+fps_warn_high = 65
+
 omega_min = 1.884
 omega_max = 2.000
 omega_step = 0.004
@@ -102,7 +111,7 @@ model_gate = 1.5
 #   -> atan(0.328 / 1.954) = 9.53°
 #
 # 如果仿真里相机改成完全水平（pitch=0），这里填 0。
-camera_pitch_deg = 9.53
+camera_pitch_deg = 9.29
 camera_yaw_deg = 0
 
 
@@ -125,7 +134,7 @@ muzzle_offset_mm = 75
 
 # 视觉+串口+云台响应的延迟（秒），不含飞行时间。
 # 仿真里视觉处理比真机快，可以先填小一点，实测再调。
-pipeline_delay = 0.08
+pipeline_delay = 0.055
 
 # 实弹标定的经验修正，仿真里先填 0
 pitch_bias_deg = 0

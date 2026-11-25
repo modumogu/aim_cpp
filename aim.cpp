@@ -206,6 +206,14 @@ struct Params {
     // 拟合
     double fit_window_s = kFitWindowS;
     int min_fit_samples = kMinFitSamples;
+    // 最小拟合时间跨度（秒）。只有样本数不够，高帧率下 20 帧可能只覆盖 0.16 秒，
+    // 正弦拟合会欠定（c0 与 c1 共线），初始模型不可信。必须同时满足跨度。
+    double min_fit_span_s = 0.30;
+
+    // 运行时帧率看门狗（只对相机模式生效；视频模式的帧率由文件决定）
+    // 做成配置项而不是常量，一是现场可调，二是能在测试里把门槛调高来验证告警。
+    double fps_warn_low = 50.0;      // 低于这个持续 2 秒就报警
+    double fps_warn_high = 65.0;     // 高于这个算恢复，重新布防
     double omega_min = kOmegaMin;
     double omega_max = kOmegaMax;
     double omega_step = kOmegaStep;
@@ -314,6 +322,9 @@ bool loadParams(const std::string& path, Params* P) {
             else if (k == "radius_tol")     P->radius_tol = std::stod(v);
             else if (k == "fit_window_s")   P->fit_window_s = std::stod(v);
             else if (k == "min_fit_samples")P->min_fit_samples = std::stoi(v);
+            else if (k == "min_fit_span_s") P->min_fit_span_s = std::stod(v);
+            else if (k == "fps_warn_low")  P->fps_warn_low = std::stod(v);
+            else if (k == "fps_warn_high") P->fps_warn_high = std::stod(v);
             else if (k == "omega_min")      P->omega_min = std::stod(v);
             else if (k == "omega_max")      P->omega_max = std::stod(v);
             else if (k == "omega_step")     P->omega_step = std::stod(v);
@@ -367,9 +378,14 @@ void printParams(const Params& P) {
     std::printf("[参数] area=[%.0f,%.0f] aspect>=%.2f extent>=%.2f hue_sd<=%.1f\n",
                 P.min_area, P.max_area, P.min_aspect, P.min_extent, P.max_hue_std);
     std::printf("[参数] gap=%.1fdeg radius_tol=%.2f\n", P.group_gap_deg, P.radius_tol);
-    std::printf("[参数] fit: win=%.2fs n>=%d w=[%.3f,%.3f]/%.3f rms<=%.3f osc>=%.2f\n",
-                P.fit_window_s, P.min_fit_samples, P.omega_min, P.omega_max,
-                P.omega_step, P.max_fit_rms, P.min_osc_amp);
+    std::printf("[参数] fit: win=%.2fs n>=%d span>=%.2fs w=[%.3f,%.3f]/%.3f "
+                "rms<=%.3f osc>=%.2f\n",
+                P.fit_window_s, P.min_fit_samples, P.min_fit_span_s,
+                P.omega_min, P.omega_max, P.omega_step, P.max_fit_rms, P.min_osc_amp);
+    std::printf("[参数] 自适应: sv=%.1f gain_below=%.0f max_gain=%.1f s_ratio=%.2f s_min=%.0f\n",
+                P.adapt_sv, P.adapt_gain_below, P.adapt_max_gain,
+                P.adapt_ratio, P.adapt_min);
+    std::printf("[参数] 看门狗: low=%.0f high=%.0f\n", P.fps_warn_low, P.fps_warn_high);
     std::printf("[参数] lead=%.3fs age<=%.3fs reset=%.1fs gate=%.2fdeg ab_tol=%.3f\n",
                 P.lead_s, P.max_pred_age, P.history_reset_age,
                 P.model_gate * 180.0 / CV_PI, P.ab_tol);
@@ -931,6 +947,10 @@ bool fitMotion(const std::vector<std::pair<double, double>>& history, double t_n
         }
     }
     if (static_cast<int>(ts.size()) < P.min_fit_samples) return false;
+    // 样本足够但跨度太短一样不能拟合：高帧率下 20 个样本可能只覆盖 0.16 秒，
+    // 这么短的弧段上 c0（偏置）与 c1（斜率）几乎共线，解出来的参数不可信。
+    // 仿真和视频都是 60fps，这个差异在那边永远暴露不出来。
+    if (ts.back() - ts.front() < P.min_fit_span_s) return false;
 
     double best_rms = 1e18;
     double best_w = 0.0;
@@ -1244,43 +1264,126 @@ bool saveImage(const std::string& path, const cv::Mat& img) {
 // ============================================================================
 //  打开相机
 // ============================================================================
+// ---------------------------------------------------------------------------
+//  相机模式候选
+//
+//  实测（2026-11-25，LRCP S200 / VID_0BDA&PID_5882，YUY2）：
+//      请求 1280x1024 -> 实际 1280x1024，只有 5.0 fps   <- 驱动这条直连路径是坏的
+//      请求 1280x960  -> 实际 1280x960，138 fps         <- 干净，但垂直裁掉 64 行
+//      请求 1920x1080 -> 实际 1280x1024，130 fps        <- 同一模式走了另一条路径
+//  ORB 单应验证三种方式视野一致（缩放 1.007~1.011），所以第 2 条路
+//  拿到的是与标定完全相同的视野，不需要重新标定。
+//
+//  顺序有意为之：优先要"尺寸恰好是标定尺寸"的模式，
+//  垂直裁切的那个放最后（需要重标定或改 cy）。
+// ---------------------------------------------------------------------------
+struct CamMode {
+    int req_w, req_h;
+    const char* note;
+};
+
+constexpr CamMode kCamModes[] = {
+    {1280, 1024, "标准"},
+    {1920, 1080, "驱动回落到 1280x1024"},
+    {1280, 960,  "垂直裁切 64 行，需重标定"},
+};
+constexpr int kCamModeCount = static_cast<int>(sizeof(kCamModes) / sizeof(kCamModes[0]));
+
+// --frames 之类用到；打开成功后由这里写出去，供启动信息打印
+int g_cam_w = 0;
+int g_cam_h = 0;
+double g_cam_fps = 0.0;
+
+// 量实际出帧速率。
+//   必须用 read() 而不是 grab()：grab() 会直接从内部缓冲返回已有帧，
+//   实测会算出 6.7e6 fps 这种离谱值，把 5fps 的坏模式误判成合格。
+//   read() 要真正取到一帧才返回，才反映相机真实速率。
+double measureReadFps(cv::VideoCapture& cap, int n) {
+    cv::Mat tmp;
+    for (int i = 0; i < 3; ++i) cap.read(tmp);      // 丢掉启动期的缓冲帧
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    int got = 0;
+    for (int i = 0; i < n; ++i) {
+        if (cap.read(tmp) && !tmp.empty()) ++got;
+    }
+    const double dt = std::chrono::duration<double>(
+                          std::chrono::high_resolution_clock::now() - t0).count();
+    return dt > 1e-6 ? static_cast<double>(got) / dt : 0.0;
+}
+
 int openCamera(cv::VideoCapture& cap, int force_index, double exposure, double wb_temp,
                double gain) {
     for (int idx = 0; idx < 5; ++idx) {
         if (force_index >= 0 && idx != force_index) continue;
 
-        cap.open(idx, cv::CAP_DSHOW);
-        if (!cap.isOpened()) {
-            cap.release();
-            continue;
-        }
+        for (int m = 0; m < kCamModeCount; ++m) {
+            const CamMode& mode = kCamModes[m];
+            cap.open(idx, cv::CAP_DSHOW);
+            if (!cap.isOpened()) {
+                cap.release();
+                break;                          // 这个索引没有相机，换索引
+            }
 
-        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'));
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, kWantW);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, kWantH);
-        cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);
-        cap.set(cv::CAP_PROP_EXPOSURE, exposure);
-        cap.set(cv::CAP_PROP_AUTO_WB, 0);
-        cap.set(cv::CAP_PROP_WB_TEMPERATURE, wb_temp);
-        // 增益必须钉死。自动增益在暗处会把噪声放大，
-        // 直接表现为 mask 里冒出一堆小碎块，面积过滤都救不回来。
-        cap.set(cv::CAP_PROP_GAIN, gain);
+            cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', '2'));
+            cap.set(cv::CAP_PROP_FRAME_WIDTH, mode.req_w);
+            cap.set(cv::CAP_PROP_FRAME_HEIGHT, mode.req_h);
+            cap.set(cv::CAP_PROP_FPS, 100);
+            cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);
+            cap.set(cv::CAP_PROP_EXPOSURE, exposure);
+            cap.set(cv::CAP_PROP_AUTO_WB, 0);
+            cap.set(cv::CAP_PROP_WB_TEMPERATURE, wb_temp);
+            // 增益必须钉死。自动增益在暗处会把噪声放大，
+            // 直接表现为 mask 里冒出一堆小碎块，面积过滤都救不回来。
+            cap.set(cv::CAP_PROP_GAIN, gain);
 
-        cv::Mat probe;
-        cap >> probe;
-        int w = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-        int h = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-        if (!probe.empty() && w == kWantW && h == kWantH) {
+            cv::Mat probe;
+            cap >> probe;
+            const int w = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+            const int h = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+            if (probe.empty() || h < 960) {
+                std::cout << "  索引 " << idx << " 请求 " << mode.req_w << "x" << mode.req_h
+                          << " 拿到 " << w << "x" << h << "，太小，跳过\n";
+                cap.release();
+                continue;
+            }
+
+            const double fps = measureReadFps(cap, 6);
+            if (fps < 40.0) {
+                // 这一条路能出图但跑不快（本机 1280x1024 直连只有 5fps）
+                std::cout << "  索引 " << idx << " 请求 " << mode.req_w << "x" << mode.req_h
+                          << " 只有 " << fps << " fps，换下一个模式\n";
+                cap.release();
+                continue;
+            }
+
+            g_cam_w = w;
+            g_cam_h = h;
+            g_cam_fps = fps;
+            std::cout << "  相机就绪：索引 " << idx << "，请求 " << mode.req_w << "x"
+                      << mode.req_h << " -> 实际 " << w << "x" << h << "，" << fps
+                      << " fps（" << mode.note << "）\n";
+            if (fps < 80.0) {
+                // 实测本机：曝光 -6(15.6ms) 只有 63.8fps，-7/-8 有 126~129fps。
+                // 曝光时间超过帧周期时帧率被直接封顶，而且不报错。
+                std::cout << "  [警告] 帧率只有 " << fps
+                          << " fps。如果这不是相机本身的上限，"
+                          << "很可能是曝光时间超过了帧周期（曝光越大帧率越低），"
+                          << "或是被其他 USB 设备抢了带宽。\n";
+            }
+            if (w != kWantW || h != kWantH) {
+                std::cout << "  [注意] 实际分辨率 " << w << "x" << h << " 与标定用的 "
+                          << kWantW << "x" << kWantH << " 不同，"
+                          << "内参（cx/cy）需要重新标定！\n";
+            }
             return idx;
         }
-        std::cout << "  索引 " << idx << " 不行（" << w << "x" << h << "），跳过\n";
-        cap.release();
     }
     return -1;
 }
 
 }  // namespace
 
+#ifndef AIM_NO_MAIN   // 由 ROS 节点以 #define AIM_NO_MAIN 后 #include 本文件时，跳过 main()
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -1377,7 +1480,7 @@ int main(int argc, char** argv) {
 
     std::cout << "分辨率 " << cap.get(cv::CAP_PROP_FRAME_WIDTH) << "x"
               << cap.get(cv::CAP_PROP_FRAME_HEIGHT)
-              << "   帧率 " << cap.get(cv::CAP_PROP_FPS)
+              << "   实测帧率 " << g_cam_fps
               << "   曝光 " << cap.get(cv::CAP_PROP_EXPOSURE)
               << "   色温 " << cap.get(cv::CAP_PROP_WB_TEMPERATURE) << "\n";
 
@@ -1403,6 +1506,9 @@ int main(int argc, char** argv) {
     bool has_last_model = false;
     int gate_rejects = 0;         // 被模型门限拒掉的帧数
     double r_est = -1.0;          // 自动估计的转盘半径（-1 = 还没估出来）
+    bool mask_warned = false;     // 掩膜为空的警告已经报过了（避免刷屏）
+    int slow_ticks = 0;           // 帧率看门狗：连续多少个 0.5 秒窗口偏低
+    bool slow_warned = false;     // 已经报过，避免刷屏
     PoseResult last_pose;         // 最近一次成功的 PnP 位姿
     double last_pose_t = -1.0;
     int pose_reuse = 0;           // 沿用了多少次上次位姿
@@ -1450,6 +1556,27 @@ int main(int argc, char** argv) {
                 fps_shown = frames_since / (now - fps_t0);
                 frames_since = 0;
                 fps_t0 = now;
+
+                // ---- 运行时帧率看门狗 ----
+                // 启动时的检查只能发现"一开始就慢"。现场更常见的是跑着跑着掉下去
+                // （中途插了 USB 设备抢带宽、笔记本热降频），程序不会报错，
+                // 但延迟翻几倍、命中率掉光。这里连续 2 秒偏低就提示一次。
+                if (use_camera && fps_shown > 0.0) {
+                    if (fps_shown < P.fps_warn_low) {
+                        ++slow_ticks;
+                        if (slow_ticks >= 4 && !slow_warned) {
+                            std::cout << "[警告] 帧率持续低于 " << P.fps_warn_low
+                                      << " fps（当前 " << fps_shown
+                                      << "）。常见原因：中途插入了别的 USB 设备抢带宽、"
+                                      << "曝光时间超过帧周期、笔记本降频。"
+                                      << "此时延迟会明显变大，建议把 pipeline_delay 相应加大。\n";
+                            slow_warned = true;
+                        }
+                    } else if (fps_shown > P.fps_warn_high) {
+                        slow_ticks = 0;
+                        slow_warned = false;   // 恢复了，重新布防
+                    }
+                }
             }
         }
 
@@ -1697,6 +1824,9 @@ int main(int argc, char** argv) {
 
         // 掩膜是空的 = 一个灯条都没进掩膜。最常见的原因就是 --color 配错。
         // 这里统计整幅图里"亮像素"的主色相，直接提示该用哪个颜色。
+        // 掩膜恢复了就复位告警标志，下次再空时重新提示一次
+        if (mask_px > 0) mask_warned = false;
+
         if (mask_px == 0 && idx % 30 == 0) {
             cv::Mat hsv_all;
             cv::cvtColor(frame, hsv_all, cv::COLOR_BGR2HSV);
@@ -1721,17 +1851,26 @@ int main(int argc, char** argv) {
                 if (H < 13.0 || H > 166.0) guess = "red";
                 else if (H >= 13.0 && H <= 46.0) guess = "yellow";
                 else if (H >= 88.0 && H <= 142.0) guess = "blue";
-                std::printf("[警告] 掩膜为空！画面亮部主色相 H=%.0f，看起来是 %s\n", H, guess);
-                if (color != guess) {
-                    std::printf("[警告] 当前位置 --color %s 与该颜色不符，试试 --color %s\n",
-                                color.c_str(), guess);
-                } else {
-                    std::printf("[警告] 颜色参数是对的，说明是饱和度/亮度阈值卡住了，"
-                                "把 S、V 下限调低试试\n");
+                // 只在"刚进入掩膜为空"这个状态时报一次。
+                // 原来每 30 帧刷一遍，120fps 下每秒 4 次，控制台 IO 会拖慢主循环。
+                if (!mask_warned) {
+                    std::printf("[警告] 掩膜为空！画面亮部主色相 H=%.0f，看起来是 %s\n",
+                                H, guess);
+                    if (color != guess) {
+                        std::printf("[警告] 当前位置 --color %s 与该颜色不符，试试 --color %s\n",
+                                    color.c_str(), guess);
+                    } else {
+                        std::printf("[警告] 颜色参数是对的，说明是饱和度/亮度阈值卡住了，"
+                                    "把 S、V 下限调低试试\n");
+                    }
+                    mask_warned = true;
                 }
             } else {
-                std::printf("[警告] 掩膜为空，且画面里几乎没有又亮又有色的像素"
-                            "（检查曝光/增益/镜头盖）\n");
+                if (!mask_warned) {
+                    std::printf("[警告] 掩膜为空，且画面里几乎没有又亮又有色的像素"
+                                "（检查曝光/增益/镜头盖）\n");
+                    mask_warned = true;
+                }
             }
         }
 
@@ -1966,3 +2105,4 @@ int main(int argc, char** argv) {
     std::cout << "处理了 " << idx << " 帧\n";
     return 0;
 }
+#endif  // AIM_NO_MAIN
